@@ -1,6 +1,6 @@
 # IREE ONNX Runtime Execution Provider
 
-ONNX Runtime Execution Provider using IREE.
+IREE based ONNX Runtime Execution Provider.
 
 ## Installation
 
@@ -8,8 +8,8 @@ ONNX Runtime Execution Provider using IREE.
 
 ```bash
 mkdir build && cd build
-cmake .. -GNinja
-ninja
+cmake ..
+make -j
 ```
 
 2. Create a virtual environment and install dependencies
