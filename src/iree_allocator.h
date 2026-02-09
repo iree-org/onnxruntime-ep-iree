@@ -5,8 +5,8 @@
 // (iree_hal_buffer_t*) as opaque pointers, which ORT passes back to Free() when
 // memory is released.
 
-#ifndef IREE_ONNX_EP_SRC_IREE_ALLOCATOR_H_
-#define IREE_ONNX_EP_SRC_IREE_ALLOCATOR_H_
+#ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_ALLOCATOR_H_
+#define ONNXRUNTIME_EP_IREE_SRC_IREE_ALLOCATOR_H_
 
 #include <unordered_map>
 
@@ -14,7 +14,7 @@
 #include "iree_wrappers.h"
 #include "ort_import.h"
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 // Device memory allocator for IREE execution provider.
 //
@@ -73,6 +73,6 @@ class IreeAllocator : public OrtAllocator {
   std::unordered_map<void*, HalBufferPtr> allocations_;
 };
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree
 
-#endif  // IREE_ONNX_EP_SRC_IREE_ALLOCATOR_H_
+#endif  // ONNXRUNTIME_EP_IREE_SRC_IREE_ALLOCATOR_H_

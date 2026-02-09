@@ -3,14 +3,14 @@
 // Implements OrtDataTransferImpl interface for copying tensors between
 // host memory and IREE device memory, and between IREE devices.
 
-#ifndef IREE_ONNX_EP_SRC_IREE_DATA_TRANSFER_H_
-#define IREE_ONNX_EP_SRC_IREE_DATA_TRANSFER_H_
+#ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_DATA_TRANSFER_H_
+#define ONNXRUNTIME_EP_IREE_SRC_IREE_DATA_TRANSFER_H_
 
 #include "iree_ep_factory.h"
 #include "iree_wrappers.h"
 #include "ort_import.h"
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 class IreeEpFactory;
 
@@ -63,6 +63,6 @@ class IreeDataTransfer : public OrtDataTransferImpl {
   IreeEpFactory& factory_;
 };
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree
 
-#endif  // IREE_ONNX_EP_SRC_IREE_DATA_TRANSFER_H_
+#endif  // ONNXRUNTIME_EP_IREE_SRC_IREE_DATA_TRANSFER_H_

@@ -7,7 +7,7 @@
 #include <numeric>
 #include <string>
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 OrtStatus* CompileToVmfb(const std::string& mlir_path,
                          const std::string& vmfb_path,
@@ -33,4 +33,4 @@ OrtStatus* CompileToVmfb(const std::string& mlir_path,
   return nullptr;
 }
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree

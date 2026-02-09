@@ -2,8 +2,8 @@
 //
 // Following the coding style requirement that all IREE C objects must use RAII.
 
-#ifndef IREE_ONNX_EP_SRC_IREE_WRAPPERS_H_
-#define IREE_ONNX_EP_SRC_IREE_WRAPPERS_H_
+#ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_WRAPPERS_H_
+#define ONNXRUNTIME_EP_IREE_SRC_IREE_WRAPPERS_H_
 
 #include <string>
 
@@ -13,7 +13,7 @@
 #include "iree/runtime/api.h"
 #include "ort_import.h"
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 // Generic RAII wrapper for IREE retain/release style objects.
 template <typename T, void (*RetainFn)(T*), void (*ReleaseFn)(T*)>
@@ -248,6 +248,6 @@ inline OrtStatus* IreeStatusToOrtStatus(iree_status_t status) {
     }                                        \
   } while (0)
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree
 
-#endif  // IREE_ONNX_EP_SRC_IREE_WRAPPERS_H_
+#endif  // ONNXRUNTIME_EP_IREE_SRC_IREE_WRAPPERS_H_

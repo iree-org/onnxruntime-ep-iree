@@ -15,7 +15,7 @@
 #include "mlir_gen.h"
 #include "temp_file.h"
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 static std::vector<std::string> GenerateCompileFlags(
     const IreeEp::Config& config) {
@@ -325,10 +325,12 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
   // Pop outputs and copy to ORT tensors.
   //
   // TODO(perf): Currently IREE allocates its own output buffers, then we copy
-  // to ORT's pre-allocated device buffers (D2D copy). We could eliminate this
-  // copy by pre-binding ORT's buffers as IREE outputs before invoke. This
-  // requires investigating iree_runtime_call_outputs_push_back_buffer_view or
-  // similar APIs to provide pre-allocated output buffers to IREE.
+  // to ORT's pre-allocated device buffers (D2D copy). The way to properly
+  // eliminate this is by passing mutable dps buffers as part of the iree input
+  // signature and writing to them. The problem is that ORT doesn't give us a
+  // good way to infer the output shape. I'm not sure what the right fix is.
+  // Maybe we could have a custom iree allocator that does the job for us?
+  // I'm just not sure how to do this properly.
   iree_vm_list_t* output_list = iree_runtime_call_outputs(call.Get());
   iree_host_size_t output_count = iree_vm_list_size(output_list);
 
@@ -365,4 +367,4 @@ void ORT_API_CALL IreeNodeComputeInfo::ReleaseStateImpl(
   // No per-invocation state to release.
 }
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree

@@ -9,7 +9,7 @@
 #include "iree_data_transfer.h"
 #include "iree_ep.h"
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 IreeEpFactory::IreeEpFactory(const char* ep_name, ApiPtrs apis,
                              const OrtLogger* default_logger)
@@ -513,4 +513,4 @@ OrtStatus* ORT_API_CALL IreeEpFactory::CreateSyncStreamForDeviceImpl(
   return nullptr;
 }
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree

@@ -1,7 +1,7 @@
 // iree_ep_factory.h - IREE Execution Provider Factory
 
-#ifndef IREE_ONNX_EP_SRC_IREE_EP_FACTORY_H_
-#define IREE_ONNX_EP_SRC_IREE_EP_FACTORY_H_
+#ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_EP_FACTORY_H_
+#define ONNXRUNTIME_EP_IREE_SRC_IREE_EP_FACTORY_H_
 
 #include <memory>
 #include <string>
@@ -11,7 +11,7 @@
 #include "iree_wrappers.h"
 #include "ort_import.h"
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 // Forward declarations.
 class IreeAllocator;
@@ -132,6 +132,6 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
   std::unique_ptr<IreeDataTransfer> data_transfer_;
 };
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree
 
-#endif  // IREE_ONNX_EP_SRC_IREE_EP_FACTORY_H_
+#endif  // ONNXRUNTIME_EP_IREE_SRC_IREE_EP_FACTORY_H_

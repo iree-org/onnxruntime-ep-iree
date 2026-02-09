@@ -23,7 +23,7 @@ pip install -r requirements.txt
 3. Install Python Package
 
 ```bash
-IREE_ONNX_EP_BUILD_DIR=$(pwd)/build uv pip install -e python/
+ONNXRUNTIME_EP_IREE_BUILD_DIR=$(pwd)/build uv pip install -e python/
 ```
 
 4. Run sample test

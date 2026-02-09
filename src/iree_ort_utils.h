@@ -3,8 +3,8 @@
 // Provides element type mapping between ONNX and IREE, and buffer/tensor
 // conversion utilities for data transfer between ORT and IREE runtime.
 
-#ifndef IREE_ONNX_EP_SRC_IREE_ORT_UTILS_H_
-#define IREE_ONNX_EP_SRC_IREE_ORT_UTILS_H_
+#ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_ORT_UTILS_H_
+#define ONNXRUNTIME_EP_IREE_SRC_IREE_ORT_UTILS_H_
 
 #include <vector>
 
@@ -12,7 +12,7 @@
 #include "iree_wrappers.h"
 #include "ort_import.h"
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 // ============================================================================
 // Element Type Mapping
@@ -87,6 +87,6 @@ std::vector<int64_t> GetBufferViewShape(iree_hal_buffer_view_t* buffer_view);
 size_t CalculateTensorByteSize(const std::vector<int64_t>& shape,
                                ONNXTensorElementDataType element_type);
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree
 
-#endif  // IREE_ONNX_EP_SRC_IREE_ORT_UTILS_H_
+#endif  // ONNXRUNTIME_EP_IREE_SRC_IREE_ORT_UTILS_H_

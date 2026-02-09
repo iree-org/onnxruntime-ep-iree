@@ -24,13 +24,13 @@ All header files must be self-contained and compile independently. Use the `.h` 
 **Include Guards**: Use the format `_<PROJECT>___<PATH>___<FILE>__H_`
 
 ```cpp
-// For file: iree_onnx_ep/runtime/session.h
-#ifndef IREE_ONNX_EP_RUNTIME_SESSION_H_
-#define IREE_ONNX_EP_RUNTIME_SESSION_H_
+// For file: onnxruntime_ep_iree/runtime/session.h
+#ifndef ONNXRUNTIME_EP_IREE_RUNTIME_SESSION_H_
+#define ONNXRUNTIME_EP_IREE_RUNTIME_SESSION_H_
 
 // ... header content ...
 
-#endif  // IREE_ONNX_EP_RUNTIME_SESSION_H_
+#endif  // ONNXRUNTIME_EP_IREE_RUNTIME_SESSION_H_
 ```
 
 ### Inline Functions
@@ -62,22 +62,22 @@ class Session {
 
 Place all code in namespaces with unique, project-based names.
 
-**Project namespace**: `iree_onnx_ep`
+**Project namespace**: `onnxruntime::iree`
 
 ```cpp
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 class Session {
   // No indentation inside namespace
 };
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree
 ```
 
 **Nested namespaces**:
 
 ```cpp
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 namespace runtime {
 
 class Executor {
@@ -85,7 +85,7 @@ class Executor {
 };
 
 }  // namespace runtime
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree
 ```
 
 **Prohibited**:
@@ -109,13 +109,13 @@ Status ValidateConfig(const Config& config) {
 
 }  // namespace
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 Status Session::Initialize(const Config& config) {
   return ValidateConfig(config);
 }
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree
 ```
 
 ### Local Variables
@@ -734,7 +734,7 @@ class Session {
 Use **lowercase**:
 
 ```cpp
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 namespace runtime {
 namespace compiler {
 ```
@@ -757,8 +757,8 @@ enum class Status {
 Use **ALL_CAPS_WITH_UNDERSCORES**:
 
 ```cpp
-#define IREE_ONNX_EP_VERSION_MAJOR 1
-#define IREE_ONNX_EP_ASSERT(condition) \
+#define ONNXRUNTIME_EP_IREE_VERSION_MAJOR 1
+#define ONNXRUNTIME_EP_IREE_ASSERT(condition) \
   do { \
     if (!(condition)) { \
       /* ... */ \
@@ -779,7 +779,7 @@ Use **ALL_CAPS_WITH_UNDERSCORES**:
 - No indentation inside namespaces
 
 ```cpp
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 class Session {
  public:
@@ -790,7 +790,7 @@ class Session {
   }
 };
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree
 ```
 
 ### Pointer and Reference Alignment
@@ -1100,7 +1100,7 @@ When macros are necessary:
 - Document non-obvious behavior
 
 ```cpp
-#define IREE_ONNX_EP_CHECK_OK(expr)           \
+#define ONNXRUNTIME_EP_IREE_CHECK_OK(expr)           \
   do {                                         \
     auto status = (expr);                      \
     if (!status.ok()) {                        \
@@ -1116,7 +1116,7 @@ When macros are necessary:
 Enable compiler warnings and static analysis:
 
 ```cmake
-target_compile_options(iree_onnx_ep PRIVATE
+target_compile_options(onnxruntime_ep_iree PRIVATE
   -Wall
   -Wextra
   -Werror

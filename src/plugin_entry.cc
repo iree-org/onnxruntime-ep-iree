@@ -25,9 +25,9 @@ ORT_EXPORT OrtStatus* CreateEpFactories(const char* registration_name,
   }
 
   // Create factory (use registration_name or "IREE").
-  auto factory = std::make_unique<iree_onnx_ep::IreeEpFactory>(
+  auto factory = std::make_unique<onnxruntime::iree::IreeEpFactory>(
       registration_name ? registration_name : "IREE",
-      iree_onnx_ep::ApiPtrs{*ort_api, *ep_api, *model_editor_api},
+      onnxruntime::iree::ApiPtrs{*ort_api, *ep_api, *model_editor_api},
       default_logger);
 
   factories[0] = factory.release();
@@ -38,7 +38,7 @@ ORT_EXPORT OrtStatus* CreateEpFactories(const char* registration_name,
 
 // Plugin cleanup
 ORT_EXPORT OrtStatus* ReleaseEpFactory(OrtEpFactory* factory) {
-  delete static_cast<iree_onnx_ep::IreeEpFactory*>(factory);
+  delete static_cast<onnxruntime::iree::IreeEpFactory*>(factory);
   return nullptr;
 }
 

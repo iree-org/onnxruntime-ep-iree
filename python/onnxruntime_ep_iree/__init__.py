@@ -7,7 +7,11 @@ from pathlib import Path
 
 __all__ = ["get_library_path", "get_ep_name", "get_ep_names"]
 
-_LIB_NAMES = ["libiree_onnx_ep.dylib", "libiree_onnx_ep.so", "iree_onnx_ep.dll"]
+_LIB_NAMES = [
+    "libonnxruntime_ep_iree.dylib",
+    "libonnxruntime_ep_iree.so",
+    "onnxruntime_ep_iree.dll",
+]
 
 
 def _find_lib_in(directory: Path) -> str | None:
@@ -25,7 +29,7 @@ def get_library_path() -> str:
 
     Lookup order:
       1. The project's ``build/`` directory, found by walking up from this package's
-         location (``python/iree_onnx_ep/ -> python/ -> project_root/ -> build/``).
+         location (``python/onnxruntime_ep_iree/ -> python/ -> project_root/ -> build/``).
          This is the primary path for editable installs — it always points to the
          latest build output, even after the C++ library is rebuilt.
       2. The package directory itself (for wheel-based installs where the library
@@ -36,7 +40,7 @@ def get_library_path() -> str:
     pkg_dir = Path(__file__).parent
 
     # 1. Check the project build directory (editable installs).
-    #    Layout: <project_root>/python/iree_onnx_ep/__init__.py
+    #    Layout: <project_root>/python/onnxruntime_ep_iree/__init__.py
     project_root = pkg_dir.parent.parent
     result = _find_lib_in(project_root / "build")
     if result:

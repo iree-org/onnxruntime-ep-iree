@@ -8,7 +8,7 @@
 #include "iree/hal/buffer_view_util.h"
 #include "iree_ep_factory.h"
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 // ============================================================================
 // Element Type Mapping
@@ -261,4 +261,4 @@ size_t CalculateTensorByteSize(const std::vector<int64_t>& shape,
   return num_elements * OnnxElementTypeSize(element_type);
 }
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree

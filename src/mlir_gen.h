@@ -12,15 +12,15 @@
 // have to directly emit torch onnx dialect instead of using torch-mlir's onnx
 // importer.
 
-#ifndef IREE_ONNX_EP_SRC_MLIR_GEN_H_
-#define IREE_ONNX_EP_SRC_MLIR_GEN_H_
+#ifndef ONNXRUNTIME_EP_IREE_SRC_MLIR_GEN_H_
+#define ONNXRUNTIME_EP_IREE_SRC_MLIR_GEN_H_
 
 #include <string>
 
 #include "iree_wrappers.h"
 #include "ort_import.h"
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 // Generates MLIR text from an OrtGraph and writes it to the specified file.
 // Small initializers are inlined in the MLIR. Large initializers are emitted as
@@ -33,6 +33,6 @@ OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& ort_api,
                         ParameterIndexPtr& out_index,
                         ParameterProviderPtr& out_provider);
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree
 
-#endif  // IREE_ONNX_EP_SRC_MLIR_GEN_H_
+#endif  // ONNXRUNTIME_EP_IREE_SRC_MLIR_GEN_H_

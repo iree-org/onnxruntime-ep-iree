@@ -6,7 +6,7 @@
 #include <fstream>
 #include <random>
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 TempFile::TempFile(std::string_view suffix) {
   // Generate random hex string for unique naming.
@@ -50,4 +50,4 @@ TempFile& TempFile::operator=(TempFile&& other) noexcept {
   return *this;
 }
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree

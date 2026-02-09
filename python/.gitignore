@@ -1,6 +1,6 @@
 /build
 /dist
 /*.egg-info
-/iree_onnx_ep/*.dylib
-/iree_onnx_ep/*.so
-/iree_onnx_ep/*.dll
+/onnxruntime_ep_iree/*.dylib
+/onnxruntime_ep_iree/*.so
+/onnxruntime_ep_iree/*.dll

@@ -3,8 +3,8 @@
 // This file defines the IreeEp class which handles graph partitioning,
 // compilation, and execution using IREE as the backend.
 
-#ifndef IREE_ONNX_EP_SRC_IREE_EP_H_
-#define IREE_ONNX_EP_SRC_IREE_EP_H_
+#ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_EP_H_
+#define ONNXRUNTIME_EP_IREE_SRC_IREE_EP_H_
 
 #include <string>
 
@@ -12,7 +12,7 @@
 #include "iree_wrappers.h"
 #include "ort_import.h"
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 // Forward declarations
 class IreeEpFactory;
@@ -113,6 +113,6 @@ struct IreeNodeComputeInfo : OrtNodeComputeInfo {
   iree_vm_function_t function_;
 };
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree
 
-#endif  // IREE_ONNX_EP_SRC_IREE_EP_H_
+#endif  // ONNXRUNTIME_EP_IREE_SRC_IREE_EP_H_

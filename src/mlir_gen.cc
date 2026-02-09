@@ -20,7 +20,7 @@
 #include "iree/io/parameter_index_provider.h"
 #include "iree_ort_utils.h"
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 namespace {
 
 // Initializers smaller than this are inlined via dense_resource + dialect
@@ -259,7 +259,7 @@ class MlirGenerator {
       attributes {{
         torch.onnx_meta.ir_version = {3} : si64,
         torch.onnx_meta.opset_version = {4} : si64,
-        torch.onnx_meta.producer_name = "iree-onnx-ep",
+        torch.onnx_meta.producer_name = "onnxruntime-ep-iree",
         torch.onnx_meta.producer_version = ""
       }} {{
 )";
@@ -712,4 +712,4 @@ OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& /*ort_api*/,
   return gen.BuildParameterArchive(out_index, out_provider);
 }
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree

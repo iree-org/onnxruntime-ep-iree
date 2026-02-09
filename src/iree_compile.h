@@ -3,14 +3,14 @@
 // Provides a function to compile MLIR files to IREE VMFB bytecode by invoking
 // the iree-compile tool as a subprocess.
 
-#ifndef IREE_ONNX_EP_SRC_IREE_COMPILE_H_
-#define IREE_ONNX_EP_SRC_IREE_COMPILE_H_
+#ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_COMPILE_H_
+#define ONNXRUNTIME_EP_IREE_SRC_IREE_COMPILE_H_
 
 #include <string>
 
 #include "ort_import.h"
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 // Compiles MLIR to VMFB using iree-compile CLI.
 //
@@ -28,6 +28,6 @@ OrtStatus* CompileToVmfb(const std::string& mlir_path,
                          const std::vector<std::string>& flags,
                          const OrtApi& ort_api);
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree
 
-#endif  // IREE_ONNX_EP_SRC_IREE_COMPILE_H_
+#endif  // ONNXRUNTIME_EP_IREE_SRC_IREE_COMPILE_H_

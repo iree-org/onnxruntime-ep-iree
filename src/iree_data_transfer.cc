@@ -5,7 +5,7 @@
 #include "iree/hal/buffer_transfer.h"
 #include "iree_ort_utils.h"
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 IreeDataTransfer::IreeDataTransfer(IreeEpFactory& factory) : factory_(factory) {
   // Initialize OrtDataTransferImpl base struct.
@@ -189,4 +189,4 @@ OrtStatus* ORT_API_CALL IreeDataTransfer::CopyTensorsImpl(
   return nullptr;
 }
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree

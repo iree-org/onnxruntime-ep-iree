@@ -1,6 +1,6 @@
-"""Setup script for the iree-onnx-ep Python package.
+"""Setup script for the onnxruntime-ep-iree Python package.
 
-Currently, we use IREE_ONNX_EP_BUILD_DIR to specify the build directory used by
+Currently, we use ONNXRUNTIME_EP_IREE_BUILD_DIR to specify the build directory used by
 the developer to built the library. The library is built externally via cmake
 and not by this setup script. It is only required at install time, not at
 runtime. For editable installs, setup.py only validates the setup.py exists in
@@ -30,17 +30,21 @@ script_dir = pathlib.Path(__file__).parent.resolve()
 # ---------------------------------------------------------------------------
 # Locate the pre-built native library via environment variable.
 # ---------------------------------------------------------------------------
-build_dir = os.environ.get("IREE_ONNX_EP_BUILD_DIR")
+build_dir = os.environ.get("ONNXRUNTIME_EP_IREE_BUILD_DIR")
 if not build_dir:
     raise EnvironmentError(
-        "IREE_ONNX_EP_BUILD_DIR environment variable must be set to the "
-        "directory containing the built libiree_onnx_ep shared library."
+        "ONNXRUNTIME_EP_IREE_BUILD_DIR environment variable must be set to the "
+        "directory containing the built libonnxruntime_ep_iree shared library."
     )
 
 build_dir = pathlib.Path(build_dir).resolve()
 
 # Find the library in the build directory.
-lib_names = ["libiree_onnx_ep.dylib", "libiree_onnx_ep.so", "iree_onnx_ep.dll"]
+lib_names = [
+    "libonnxruntime_ep_iree.dylib",
+    "libonnxruntime_ep_iree.so",
+    "onnxruntime_ep_iree.dll",
+]
 found = [build_dir / name for name in lib_names if (build_dir / name).exists()]
 if len(found) != 1:
     raise FileNotFoundError(
@@ -55,7 +59,7 @@ ep_lib_path = found[0]
 # (get_library_path() finds it via relative path), but it's harmless and
 # keeps setup.py simple — no need to detect which install mode we're in.
 # ---------------------------------------------------------------------------
-pkg_dir = script_dir / "iree_onnx_ep"
+pkg_dir = script_dir / "onnxruntime_ep_iree"
 dst = pkg_dir / ep_lib_path.name
 if dst.resolve() != ep_lib_path.resolve():
     shutil.copyfile(ep_lib_path, dst)
@@ -74,14 +78,14 @@ class BinaryDistribution(Distribution):
 
 
 setup(
-    name="iree-onnx-ep",
+    name="onnxruntime-ep-iree",
     version="0.1.0",
     description="Python helpers for the IREE ONNX Runtime Execution Provider",
-    packages=["iree_onnx_ep"],
+    packages=["onnxruntime_ep_iree"],
     # Includes ``*.dylib``, ``*.so``, ``*.dll`` so that when the library IS copied
     # for wheel builds, it ends up in the installed package.
     package_data={
-        "iree_onnx_ep": ["*.dylib", "*.so", "*.dll"],
+        "onnxruntime_ep_iree": ["*.dylib", "*.so", "*.dll"],
     },
     include_package_data=True,
     distclass=BinaryDistribution,

@@ -5,7 +5,7 @@
 #include "iree/hal/allocator.h"
 #include "iree/hal/buffer.h"
 
-namespace iree_onnx_ep {
+namespace onnxruntime::iree {
 
 IreeAllocator::IreeAllocator(uint32_t device_id, iree_hal_device_t* device,
                              const OrtMemoryInfo* memory_info,
@@ -126,4 +126,4 @@ IreeAllocator::InfoImpl(const OrtAllocator* this_) {
   return self->memory_info_;
 }
 
-}  // namespace iree_onnx_ep
+}  // namespace onnxruntime::iree

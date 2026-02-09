@@ -8,7 +8,7 @@ import numpy as np
 import onnx
 from onnx import helper, TensorProto
 import onnxruntime as ort
-import iree_onnx_ep
+import onnxruntime_ep_iree
 
 
 def test_io_binding():
@@ -18,11 +18,13 @@ def test_io_binding():
     ort.set_default_logger_severity(0)
 
     # Get the path to the built EP library
-    ep_lib_path = iree_onnx_ep.get_library_path()
+    ep_lib_path = onnxruntime_ep_iree.get_library_path()
     print(f"EP library path: {ep_lib_path}")
 
     # Register the EP plugin
-    ort.register_execution_provider_library(iree_onnx_ep.get_ep_name(), ep_lib_path)
+    ort.register_execution_provider_library(
+        onnxruntime_ep_iree.get_ep_name(), ep_lib_path
+    )
     print("EP plugin registered successfully")
 
     # Get IREE device

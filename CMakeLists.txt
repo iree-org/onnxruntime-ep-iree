@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(iree_onnx_ep VERSION 0.1.0 LANGUAGES CXX)
+project(onnxruntime_ep_iree VERSION 0.1.0 LANGUAGES CXX)
 
 # C++20 required (for std::format)
 set(CMAKE_CXX_STANDARD 20)
@@ -129,7 +129,7 @@ else()
 endif()
 
 # Build shared library (EP plugin)
-add_library(iree_onnx_ep SHARED
+add_library(onnxruntime_ep_iree SHARED
   src/plugin_entry.cc
   src/iree_ep_factory.cc
   src/iree_ep.cc
@@ -142,7 +142,7 @@ add_library(iree_onnx_ep SHARED
 )
 
 # Statically link IREE runtime and io/parameter libraries.
-target_link_libraries(iree_onnx_ep PRIVATE
+target_link_libraries(onnxruntime_ep_iree PRIVATE
   iree_runtime_unified
   iree_io_parameter_index
   iree_io_parameter_index_provider
@@ -152,13 +152,13 @@ target_link_libraries(iree_onnx_ep PRIVATE
 
 
 # Include directories
-target_include_directories(iree_onnx_ep PRIVATE
+target_include_directories(onnxruntime_ep_iree PRIVATE
   ${IREE_EP_ONNX_SRC_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 # Compiler flags
-target_compile_options(iree_onnx_ep PRIVATE
+target_compile_options(onnxruntime_ep_iree PRIVATE
   -Wall
   -Wextra
   -Werror
@@ -169,18 +169,18 @@ target_compile_options(iree_onnx_ep PRIVATE
 # Export symbols for plugin loading
 if(UNIX AND NOT APPLE)
   # Linux: Use version script
-  set_target_properties(iree_onnx_ep PROPERTIES
+  set_target_properties(onnxruntime_ep_iree PROPERTIES
     LINK_FLAGS "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/symbols.lds"
   )
 elseif(APPLE)
   # macOS: Export all symbols
-  set_target_properties(iree_onnx_ep PROPERTIES
+  set_target_properties(onnxruntime_ep_iree PROPERTIES
     LINK_FLAGS "-Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/src/symbols.txt"
   )
 endif()
 
 # Install
-install(TARGETS iree_onnx_ep
+install(TARGETS onnxruntime_ep_iree
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
 )
