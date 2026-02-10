@@ -1,7 +1,15 @@
-// iree_compile.h - MLIR to VMFB compilation via iree-compile CLI.
+//===- iree_compile.h -----------------------------------------------------===//
+//
+// Copyright 2026 The IREE Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Provides a function to compile MLIR files to IREE VMFB bytecode by invoking
 // the iree-compile tool as a subprocess.
+//
+//===----------------------------------------------------------------------===//
 
 #ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_COMPILE_H_
 #define ONNXRUNTIME_EP_IREE_SRC_IREE_COMPILE_H_

@@ -1,9 +1,17 @@
-// iree_allocator.h - IREE device memory allocator for ORT.
+//===- iree_allocator.h ---------------------------------------------------===//
+//
+// Copyright 2026 The IREE Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Implements OrtAllocator interface for allocating device-local memory using
 // IREE's HAL allocator. The allocator returns buffer handles
 // (iree_hal_buffer_t*) as opaque pointers, which ORT passes back to Free() when
 // memory is released.
+//
+//===----------------------------------------------------------------------===//
 
 #ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_ALLOCATOR_H_
 #define ONNXRUNTIME_EP_IREE_SRC_IREE_ALLOCATOR_H_

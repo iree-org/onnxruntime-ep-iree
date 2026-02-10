@@ -1,8 +1,16 @@
-// ort_import.h - ONNX Runtime API import header.
+//===- ort_import.h -------------------------------------------------------===//
+//
+// Copyright 2026 The IREE Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // This header wraps the ONNX Runtime C++ API include with the necessary
 // ORT_API_MANUAL_INIT define to prevent static initialization issues.
 // Include this file instead of including onnxruntime_cxx_api.h directly.
+//
+//===----------------------------------------------------------------------===//
 
 #ifndef ONNXRUNTIME_EP_IREE_SRC_ORT_IMPORT_H_
 #define ONNXRUNTIME_EP_IREE_SRC_ORT_IMPORT_H_

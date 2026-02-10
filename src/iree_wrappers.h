@@ -1,6 +1,14 @@
-// iree_wrappers.h - RAII wrappers for IREE C objects.
+//===- iree_wrappers.h ----------------------------------------------------===//
+//
+// Copyright 2026 The IREE Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Following the coding style requirement that all IREE C objects must use RAII.
+//
+//===----------------------------------------------------------------------===//
 
 #ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_WRAPPERS_H_
 #define ONNXRUNTIME_EP_IREE_SRC_IREE_WRAPPERS_H_

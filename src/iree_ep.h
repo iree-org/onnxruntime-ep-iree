@@ -1,7 +1,15 @@
-// iree_ep.h - IREE Execution Provider
+//===- iree_ep.h ----------------------------------------------------------===//
+//
+// Copyright 2026 The IREE Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // This file defines the IreeEp class which handles graph partitioning,
 // compilation, and execution using IREE as the backend.
+//
+//===----------------------------------------------------------------------===//
 
 #ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_EP_H_
 #define ONNXRUNTIME_EP_IREE_SRC_IREE_EP_H_

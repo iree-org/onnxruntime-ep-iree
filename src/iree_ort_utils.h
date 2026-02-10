@@ -1,7 +1,15 @@
-// iree_ort_utils.h - ORT/IREE type conversion and tensor utilities.
+//===- iree_ort_utils.h ---------------------------------------------------===//
+//
+// Copyright 2026 The IREE Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Provides element type mapping between ONNX and IREE, and buffer/tensor
 // conversion utilities for data transfer between ORT and IREE runtime.
+//
+//===----------------------------------------------------------------------===//
 
 #ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_ORT_UTILS_H_
 #define ONNXRUNTIME_EP_IREE_SRC_IREE_ORT_UTILS_H_

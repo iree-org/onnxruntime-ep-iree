@@ -1,7 +1,15 @@
-// iree_data_transfer.h - Data transfer implementation for IREE EP.
+//===- iree_data_transfer.h -----------------------------------------------===//
+//
+// Copyright 2026 The IREE Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Implements OrtDataTransferImpl interface for copying tensors between
 // host memory and IREE device memory, and between IREE devices.
+//
+//===----------------------------------------------------------------------===//
 
 #ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_DATA_TRANSFER_H_
 #define ONNXRUNTIME_EP_IREE_SRC_IREE_DATA_TRANSFER_H_

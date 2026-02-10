@@ -1,7 +1,15 @@
-// iree_ep.cc - IREE Execution Provider Implementation
+//===- iree_ep.cc ---------------------------------------------------------===//
+//
+// Copyright 2026 The IREE Authors
+//
+// Licensed under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Implements IREE-based compilation and execution for ONNX models.
 // Uses IREE runtime API for loading VMFB modules and executing functions.
+//
+//===----------------------------------------------------------------------===//
 
 #include "iree_ep.h"
 
