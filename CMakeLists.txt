@@ -77,7 +77,7 @@ endif()
 # Prefer to keep the IREE_GIT_TAG synced with the python-installed IREE version.
 # At a minimum, the compiler from those packages must be compatible with the
 # runtime at this source ref.
-set(IREE_GIT_TAG "v3.9.0")
+set(IREE_GIT_TAG "v3.10.0")
 set(IREE_SOURCE_DIR "" CACHE FILEPATH "Path to IREE source")
 
 # Set IREE build flags.
