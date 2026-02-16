@@ -16,6 +16,7 @@
 #ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_ALLOCATOR_H_
 #define ONNXRUNTIME_EP_IREE_SRC_IREE_ALLOCATOR_H_
 
+#include <mutex>
 #include <unordered_map>
 
 #include "iree_ep_factory.h"
@@ -74,10 +75,12 @@ class IreeAllocator : public OrtAllocator {
   const OrtMemoryInfo* memory_info_;  // Non-owning (owned by factory).
   Ort::Logger logger_;
 
+  // Protects allocations_ for concurrent Alloc/Free from parallel inference.
+  mutable std::mutex allocations_mutex_;
+
   // Tracks allocated buffers for ownership management.
   // Key: iree_hal_buffer_t* (the value returned by Alloc)
   // Value: RAII wrapper that releases buffer on destruction.
-  // TODO(thread-safety): Add std::mutex for thread-safe access.
   std::unordered_map<void*, HalBufferPtr> allocations_;
 };
 
