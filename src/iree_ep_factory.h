@@ -12,6 +12,7 @@
 #define ONNXRUNTIME_EP_IREE_SRC_IREE_EP_FACTORY_H_
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -66,6 +67,9 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
   const Ort::Logger& Logger() const { return logger_; }
 
  private:
+  // Internal version of GetDeviceForId that assumes factory_mutex_ is already held.
+  iree_hal_device_t* GetDeviceForIdLocked(uint32_t device_id);
+
   // Factory interface implementations (called via function pointers)
   static const char* ORT_API_CALL
   GetNameImpl(const OrtEpFactory* this_ptr) noexcept;
@@ -123,8 +127,11 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
   // Owned by the factory and released in the destructor.
   std::vector<OrtHardwareDevice*> hw_devices_;
 
+  // Protects device_cache_, allocators_, and data_transfer_ for thread safety.
+  // ORT may call factory methods concurrently from multiple sessions.
+  mutable std::mutex factory_mutex_;
+
   // Cache of HAL devices by device_id. Created lazily when allocator is needed.
-  // TODO(thread-safety): Add mutex for thread-safe access.
   std::unordered_map<uint32_t, HalDevicePtr> device_cache_;
 
   // Memory info objects for device-local memory, indexed by device_id.
@@ -133,7 +140,6 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
   std::vector<Ort::MemoryInfo> device_memory_infos_;
 
   // Allocators by device_id. Created lazily when requested.
-  // TODO(thread-safety): Add mutex for thread-safe access.
   std::unordered_map<uint32_t, std::unique_ptr<IreeAllocator>> allocators_;
 
   // Shared data transfer instance. Created lazily when requested.

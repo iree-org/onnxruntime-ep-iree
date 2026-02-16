@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <mutex>
 
 #include "iree_allocator.h"
 #include "iree_data_transfer.h"
@@ -161,8 +162,11 @@ IreeEpFactory::~IreeEpFactory() {
 }
 
 iree_hal_device_t* IreeEpFactory::GetDeviceForId(uint32_t device_id) {
-  // TODO(thread-safety): Lock mutex before accessing device_cache_.
+  std::lock_guard<std::mutex> lock(factory_mutex_);
+  return GetDeviceForIdLocked(device_id);
+}
 
+iree_hal_device_t* IreeEpFactory::GetDeviceForIdLocked(uint32_t device_id) {
   // Check if device is already cached.
   auto it = device_cache_.find(device_id);
   if (it != device_cache_.end()) {
@@ -439,7 +443,7 @@ OrtStatus* ORT_API_CALL IreeEpFactory::CreateAllocatorImpl(
   }
   uint32_t device_id = static_cast<uint32_t>(device_id_signed);
 
-  // TODO(thread-safety): Lock mutex before accessing allocators_ map.
+  std::lock_guard<std::mutex> lock(factory->factory_mutex_);
 
   // Check if allocator already exists for this device.
   auto it = factory->allocators_.find(device_id);
@@ -459,7 +463,8 @@ OrtStatus* ORT_API_CALL IreeEpFactory::CreateAllocatorImpl(
   }
 
   // Get or create the HAL device for this device_id.
-  iree_hal_device_t* device = factory->GetDeviceForId(device_id);
+  // Use locked variant since we already hold factory_mutex_.
+  iree_hal_device_t* device = factory->GetDeviceForIdLocked(device_id);
   if (device == nullptr) {
     return Ort::Status("IREE EP: Failed to get device for allocator",
                        ORT_INVALID_ARGUMENT)
@@ -495,7 +500,7 @@ OrtStatus* ORT_API_CALL IreeEpFactory::CreateDataTransferImpl(
     OrtEpFactory* this_ptr, OrtDataTransferImpl** data_transfer) noexcept {
   auto* factory = static_cast<IreeEpFactory*>(this_ptr);
 
-  // TODO(thread-safety): Ensure thread-safe lazy initialization.
+  std::lock_guard<std::mutex> lock(factory->factory_mutex_);
 
   // Create data transfer if not already created.
   if (!factory->data_transfer_) {

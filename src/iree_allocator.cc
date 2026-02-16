@@ -12,6 +12,8 @@
 
 #include "iree_allocator.h"
 
+#include <mutex>
+
 #include "iree/hal/allocator.h"
 #include "iree/hal/buffer.h"
 
@@ -48,9 +50,6 @@ IreeAllocator::~IreeAllocator() {
 void* ORT_API_CALL IreeAllocator::AllocImpl(OrtAllocator* this_, size_t size) {
   auto* self = static_cast<IreeAllocator*>(this_);
 
-  // TODO(thread-safety): std::lock_guard<std::mutex>
-  // lock(self->allocations_mutex_);
-
   if (size == 0) {
     return nullptr;
   }
@@ -65,7 +64,7 @@ void* ORT_API_CALL IreeAllocator::AllocImpl(OrtAllocator* this_, size_t size) {
   params.usage = IREE_HAL_BUFFER_USAGE_DEFAULT | IREE_HAL_BUFFER_USAGE_TRANSFER;
   params.access = IREE_HAL_MEMORY_ACCESS_ALL;
 
-  // Allocate the buffer.
+  // Allocate the buffer. IREE HAL allocators are thread-safe.
   // TODO(async): Track allocation semaphore for async deallocation.
   HalBufferPtr buffer;
   iree_status_t status = iree_hal_allocator_allocate_buffer(
@@ -94,7 +93,10 @@ void* ORT_API_CALL IreeAllocator::AllocImpl(OrtAllocator* this_, size_t size) {
   // validation that when the pointer is freed, we actually owned it and free
   // any unfreed memory on teardown.
   iree_hal_buffer_t* buffer_ptr = buffer.Get();
-  self->allocations_[buffer_ptr] = std::move(buffer);
+  {
+    std::lock_guard<std::mutex> lock(self->allocations_mutex_);
+    self->allocations_[buffer_ptr] = std::move(buffer);
+  }
 
   ORT_CXX_LOGF_NOEXCEPT(self->logger_, ORT_LOGGING_LEVEL_INFO,
                         "IREE EP: Allocated %zu bytes on device %u (buffer=%p)",
@@ -107,12 +109,11 @@ void* ORT_API_CALL IreeAllocator::AllocImpl(OrtAllocator* this_, size_t size) {
 void ORT_API_CALL IreeAllocator::FreeImpl(OrtAllocator* this_, void* p) {
   auto* self = static_cast<IreeAllocator*>(this_);
 
-  // TODO(thread-safety): std::lock_guard<std::mutex>
-  // lock(self->allocations_mutex_);
-
   if (p == nullptr) {
     return;
   }
+
+  std::lock_guard<std::mutex> lock(self->allocations_mutex_);
 
   auto it = self->allocations_.find(p);
   if (it == self->allocations_.end()) {
