@@ -198,6 +198,10 @@ def test_with_save_intermediates(iree_device):
 
         _cleanup_iree_files(new_mlir, new_irpa)
     finally:
+        # Release the ORT session before cleanup. On Windows, the session
+        # holds memory-mapped handles to external weight files which
+        # prevents their deletion.
+        del session
         _cleanup_model_dir(model_dir)
 
 
@@ -213,4 +217,8 @@ def test_without_save_intermediates(iree_device):
 
         np.testing.assert_allclose(result, EXPECTED, rtol=1e-5, atol=1e-5)
     finally:
+        # Release the ORT session before cleanup. On Windows, the session
+        # holds memory-mapped handles to external weight files which
+        # prevents their deletion.
+        del session
         _cleanup_model_dir(model_dir)

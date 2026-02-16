@@ -1,0 +1,39 @@
+name: CI (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    env:
+      BUILD_DIR: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt numpy
+
+      - name: CMake - configure
+        run: cmake -G Ninja -B ${{ env.BUILD_DIR }} -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+
+      - name: CMake - build
+        run: cmake --build ${{ env.BUILD_DIR }}
+
+      - name: Install Python package
+        run: |
+          $env:ONNXRUNTIME_EP_IREE_BUILD_DIR = "${{ github.workspace }}\${{ env.BUILD_DIR }}"
+          pip install -e python/
+
+      - name: Run tests
+        run: pytest test/ -v

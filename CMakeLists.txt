@@ -158,16 +158,28 @@ target_include_directories(onnxruntime_ep_iree PRIVATE
 )
 
 # Compiler flags
-target_compile_options(onnxruntime_ep_iree PRIVATE
-  -Wall
-  -Wextra
-  -Werror
-  $<$<CONFIG:Debug>:-g -O0>
-  $<$<CONFIG:Release>:-O3>
-)
+if(MSVC)
+  target_compile_options(onnxruntime_ep_iree PRIVATE /W3)
+  target_compile_definitions(onnxruntime_ep_iree PRIVATE
+    _CRT_SECURE_NO_WARNINGS
+  )
+else()
+  target_compile_options(onnxruntime_ep_iree PRIVATE
+    -Wall
+    -Wextra
+    -Werror
+    $<$<CONFIG:Debug>:-g -O0>
+    $<$<CONFIG:Release>:-O3>
+  )
+endif()
 
 # Export symbols for plugin loading
-if(UNIX AND NOT APPLE)
+if(MSVC)
+  # Windows: Use .def file (ORT_EXPORT is defined as empty in ORT headers on Windows)
+  set_target_properties(onnxruntime_ep_iree PROPERTIES
+    LINK_FLAGS "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/symbols.def"
+  )
+elseif(UNIX AND NOT APPLE)
   # Linux: Use version script
   set_target_properties(onnxruntime_ep_iree PROPERTIES
     LINK_FLAGS "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/symbols.lds"
