@@ -21,6 +21,51 @@
 
 namespace onnxruntime::iree {
 
+namespace {
+
+// Stub kernel — never instantiated or executed. Exists only to satisfy the
+// CustomOpBase<TOp, TKernel> template requirements.
+struct ExternDispatchKernel {
+  void Compute(OrtKernelContext*) {}
+};
+
+// Stub custom op so ORT validates com.iree:ExternDispatch nodes during model
+// load. Never executed — the EP compiles the node via EmitExternDispatch.
+//
+// Homogeneity is disabled so variadic inputs/outputs can have mixed types
+// (e.g., f32 data tensors alongside i64 scalar inputs for $N references).
+struct ExternDispatchOp
+    : Ort::CustomOpBase<ExternDispatchOp, ExternDispatchKernel, false> {
+  const char* GetName() const { return "ExternDispatch"; }
+
+  size_t GetInputTypeCount() const { return 1; }
+  ONNXTensorElementDataType GetInputType(size_t) const {
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  }
+  OrtCustomOpInputOutputCharacteristic GetInputCharacteristic(size_t) const {
+    return INPUT_OUTPUT_VARIADIC;
+  }
+  bool GetVariadicInputHomogeneity() const { return false; }
+
+  size_t GetOutputTypeCount() const { return 1; }
+  ONNXTensorElementDataType GetOutputType(size_t) const {
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  }
+  OrtCustomOpInputOutputCharacteristic GetOutputCharacteristic(size_t) const {
+    return INPUT_OUTPUT_VARIADIC;
+  }
+  bool GetVariadicOutputHomogeneity() const { return false; }
+
+  void* CreateKernel(const OrtApi&, const OrtKernelInfo*) const {
+    return nullptr;
+  }
+};
+
+// File-static instance — must outlive all sessions.
+ExternDispatchOp g_extern_dispatch_op;
+
+}  // namespace
+
 IreeEpFactory::IreeEpFactory(const char* ep_name, ApiPtrs apis,
                              const OrtLogger* default_logger)
     : OrtEpFactory{},
@@ -43,6 +88,12 @@ IreeEpFactory::IreeEpFactory(const char* ep_name, ApiPtrs apis,
   CreateDataTransfer = CreateDataTransferImpl;
   IsStreamAware = IsStreamAwareImpl;
   CreateSyncStreamForDevice = CreateSyncStreamForDeviceImpl;
+  GetNumCustomOpDomains = GetNumCustomOpDomainsImpl;
+  GetCustomOpDomains = GetCustomOpDomainsImpl;
+
+  // Register the com.iree custom op domain for ExternDispatch nodes.
+  extern_dispatch_domain_ = Ort::CustomOpDomain("com.iree");
+  extern_dispatch_domain_.Add(&g_extern_dispatch_op);
 
   // Initialize IREE runtime instance (shared across all EPs).
   iree_runtime_instance_options_t instance_options;
@@ -354,6 +405,8 @@ OrtStatus* ORT_API_CALL IreeEpFactory::CreateEpImpl(
         sess_opts.GetConfigEntryOrDefault("ep.iree.opt_level", "O0");
     config.save_intermediates = sess_opts.GetConfigEntryOrDefault(
                                     "ep.iree.save_intermediates", "0") == "1";
+    config.extern_kernel_path =
+        sess_opts.GetConfigEntryOrDefault("ep.iree.extern_kernel_path", "");
   }
 
   // Select backend based on driver.
@@ -520,6 +573,33 @@ OrtStatus* ORT_API_CALL IreeEpFactory::CreateSyncStreamForDeviceImpl(
     OrtSyncStreamImpl** stream) noexcept {
   // Not stream aware
   *stream = nullptr;
+  return nullptr;
+}
+
+// Custom op domain support for com.iree:ExternDispatch nodes.
+
+/*static*/
+OrtStatus* ORT_API_CALL IreeEpFactory::GetNumCustomOpDomainsImpl(
+    OrtEpFactory* /*this_ptr*/, size_t* num_domains) noexcept {
+  *num_domains = 1;  // "com.iree"
+  return nullptr;
+}
+
+/*static*/
+OrtStatus* ORT_API_CALL IreeEpFactory::GetCustomOpDomainsImpl(
+    OrtEpFactory* this_ptr, OrtCustomOpDomain** domains,
+    size_t num_domains) noexcept {
+  // ORT calls GetNumCustomOpDomains() first and pre-allocates the array with
+  // that size, so num_domains should always match what we reported (1).
+  if (num_domains < 1) {
+    return Ort::Status(
+               "IREE EP: GetCustomOpDomains called with num_domains=0 "
+               "(expected 1)",
+               ORT_INVALID_ARGUMENT)
+        .release();
+  }
+  auto* factory = static_cast<IreeEpFactory*>(this_ptr);
+  domains[0] = factory->extern_dispatch_domain_;
   return nullptr;
 }
 
