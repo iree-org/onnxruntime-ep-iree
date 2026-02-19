@@ -30,16 +30,34 @@
 
 namespace onnxruntime::iree {
 
+// Target configuration passed to the MLIR generator. Always populated with the
+// EP's main target arch and backend. When the graph contains
+// com.iree:ExternDispatch nodes, this info is used to emit hal.dispatch.extern
+// ops with the correct executable target.
+struct TargetConfig {
+  std::string target_arch;  // e.g., "gfx1100"
+  std::string backend;      // e.g., "hip"
+  std::string hal_backend;  // e.g., "rocm" (HAL executable target backend)
+  std::string hal_format;   // e.g., "rocm-hsaco-fb" (HAL executable format)
+
+  // Creates a TargetConfig, resolving hal_backend/hal_format from backend.
+  static TargetConfig Create(const std::string& target_arch,
+                             const std::string& backend);
+};
+
 // Generates MLIR text from an OrtGraph and writes it to the specified file.
 // Small initializers are inlined in the MLIR. Large initializers are emitted as
 // parameter references and their data is written to an IRPA archive at
 // irpa_path. out_index and out_provider are populated with the parameter index
 // and provider for the archive. They remain null if no parameters are needed.
+// com.iree:ExternDispatch nodes are emitted as hal.dispatch.extern ops using
+// the target info from target_config.
 OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& ort_api,
                         const std::string& mlir_path,
                         const std::string& irpa_path,
                         ParameterIndexPtr& out_index,
-                        ParameterProviderPtr& out_provider);
+                        ParameterProviderPtr& out_provider,
+                        TargetConfig target_config);
 
 }  // namespace onnxruntime::iree
 
