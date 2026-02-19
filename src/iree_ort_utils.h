@@ -14,6 +14,7 @@
 #ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_ORT_UTILS_H_
 #define ONNXRUNTIME_EP_IREE_SRC_IREE_ORT_UTILS_H_
 
+#include <format>
 #include <vector>
 
 #include "iree/hal/api.h"
@@ -21,6 +22,19 @@
 #include "ort_import.h"
 
 namespace onnxruntime::iree {
+
+// ============================================================================
+// Error Helpers
+// ============================================================================
+
+// Creates an ORT error status. Accepts std::format arguments directly.
+// Usage: return MakeError("expected {}, got {}", expected, actual);
+template <typename... Args>
+OrtStatus* MakeError(std::format_string<Args...> fmt, Args&&... args) {
+  return Ort::Status(std::format(fmt, std::forward<Args>(args)...).c_str(),
+                     ORT_FAIL)
+      .release();
+}
 
 // ============================================================================
 // Element Type Mapping
