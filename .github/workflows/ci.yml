@@ -8,8 +8,39 @@ on:
     branches: [main]
 
 jobs:
-  build:
+  build-and-test:
     runs-on: ubuntu-latest
+    env:
+      BUILD_DIR: build
+      CC: clang
+      CXX: clang++
     steps:
       - uses: actions/checkout@v4
-      - run: echo "CI skeleton — tests will be added in a follow-up PR."
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt numpy
+
+      - name: CMake - configure
+        run: cmake -G Ninja -B ${BUILD_DIR} -DCMAKE_BUILD_TYPE=Release
+
+      - name: CMake - build
+        run: cmake --build ${BUILD_DIR}
+
+      - name: Install Python package
+        run: |
+          ONNXRUNTIME_EP_IREE_BUILD_DIR=${{ github.workspace }}/${BUILD_DIR} \
+            pip install -e python/
+
+      - name: Run tests
+        run: |
+          cd test
+          python test_ep_load.py
+          python test_initializers.py
+          python test_save_intermediates.py
