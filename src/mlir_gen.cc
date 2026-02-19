@@ -28,6 +28,7 @@
 #include "iree/io/formats/irpa/irpa_builder.h"
 #include "iree/io/parameter_index.h"
 #include "iree/io/parameter_index_provider.h"
+#include "iree_ep.h"
 #include "iree_ort_utils.h"
 
 namespace onnxruntime::iree {
@@ -139,7 +140,12 @@ std::string GetElementType(ONNXTensorElementDataType dtype,
 }
 
 // Formats a tensor type as !torch.vtensor<[dims],dtype>.
-std::string FormatTensorType(const Ort::ConstTypeInfo& type_info) {
+// When static_specs is provided, dynamic dims whose symbolic name matches a
+// kStatic spec are replaced with the concrete value.
+std::string FormatTensorType(
+    const Ort::ConstTypeInfo& type_info,
+    const std::unordered_map<std::string, const DimSpec*>& static_specs = {},
+    const std::vector<const char*>& symbolic_dims = {}) {
   if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
     return "NYI";  // NYI: non-tensor types.
   }
@@ -155,8 +161,15 @@ std::string FormatTensorType(const Ort::ConstTypeInfo& type_info) {
       ss << ",";
     }
     if (shape[i] < 0) {
-      // TODO: Ensure that dynamic dimensions are actually represented as -1. I
-      // checked and they seem to but an example to check would be good.
+      // Check if this dynamic dim has a static specialization.
+      if (i < symbolic_dims.size() && symbolic_dims[i] != nullptr &&
+          symbolic_dims[i][0] != '\0') {
+        auto it = static_specs.find(symbolic_dims[i]);
+        if (it != static_specs.end()) {
+          ss << it->second->value;
+          continue;
+        }
+      }
       ss << "?";
     } else {
       ss << shape[i];
@@ -168,7 +181,12 @@ std::string FormatTensorType(const Ort::ConstTypeInfo& type_info) {
 
 // Formats a tensor type as tensor<dimsxdtype> (standard MLIR format).
 // Uses signless integer types as required by MLIR tensor dialect.
-std::string FormatMlirTensorType(const Ort::ConstTypeInfo& type_info) {
+// When static_specs is provided, dynamic dims whose symbolic name matches a
+// kStatic spec are replaced with the concrete value.
+std::string FormatMlirTensorType(
+    const Ort::ConstTypeInfo& type_info,
+    const std::unordered_map<std::string, const DimSpec*>& static_specs = {},
+    const std::vector<const char*>& symbolic_dims = {}) {
   if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
     return "NYI";
   }
@@ -181,6 +199,16 @@ std::string FormatMlirTensorType(const Ort::ConstTypeInfo& type_info) {
   ss << "tensor<";
   for (size_t i = 0; i < shape.size(); ++i) {
     if (shape[i] < 0) {
+      // Check if this dynamic dim has a static specialization.
+      if (i < symbolic_dims.size() && symbolic_dims[i] != nullptr &&
+          symbolic_dims[i][0] != '\0') {
+        auto it = static_specs.find(symbolic_dims[i]);
+        if (it != static_specs.end()) {
+          ss << it->second->value;
+          ss << "x";
+          continue;
+        }
+      }
       ss << "?";
     } else {
       ss << shape[i];
@@ -198,11 +226,31 @@ class MlirGenerator {
                 const std::string& irpa_path)
       : graph_(graph), out_(out), irpa_path_(irpa_path) {}
 
-  void Generate() {
+  // A single (suffix, dim_specs) variant for MLIR generation.
+  struct VariantInfo {
+    std::string suffix;           // Function name suffix (e.g., "_variant0").
+    const DimSpecVariant* specs;  // Dim specs for this variant.
+  };
+
+  // Generates an MLIR module containing one function per variant.
+  // All functions share the same module (and thus the same parameter
+  // references), so when compiled to a single VMFB the weights are shared.
+  // For the unspecialized case, pass a single variant with empty suffix/specs.
+  // Returns the MLIR function name for each variant (parallel to input).
+  std::vector<std::string> Generate(const std::vector<VariantInfo>& variants) {
     CollectMetadata();
-    EmitModuleHeader();
-    EmitFunctionBody();
-    EmitModuleFooter();
+    std::vector<std::string> function_names;
+    function_names.reserve(variants.size());
+    out_ << "module {\n";
+    for (const auto& v : variants) {
+      ConfigureForVariant(*v.specs, v.suffix);
+      function_names.push_back(graph_name_);
+      EmitFunctionHeader();
+      EmitFunctionBody();
+      out_ << "  }\n";  // Close function.
+    }
+    out_ << "}\n";  // Close module.
+    return function_names;
   }
 
   // Builds an IRPA parameter archive for large initializers and creates a
@@ -213,12 +261,6 @@ class MlirGenerator {
 
  private:
   void CollectMetadata() {
-    // Get graph name.
-    graph_name_ = SanitizeName(graph_.GetName());
-    if (graph_name_.empty()) {
-      graph_name_ = "main";
-    }
-
     // Get IR version.
     ir_version_ = graph_.GetOnnxIRVersion();
 
@@ -235,16 +277,12 @@ class MlirGenerator {
     auto inputs = graph_.GetInputs();
     auto initializers = graph_.GetInitializers();
 
-    // Build set of initializer names.
     std::unordered_set<std::string> init_names;
     for (const auto& init : initializers) {
       init_names.insert(init.GetName());
     }
-
-    // Graph inputs are those not in initializers.
     for (const auto& input : inputs) {
-      std::string name = input.GetName();
-      if (init_names.find(name) == init_names.end()) {
+      if (!init_names.contains(input.GetName())) {
         graph_inputs_.push_back(input);
       }
     }
@@ -254,31 +292,93 @@ class MlirGenerator {
 
     // Initializers.
     initializers_ = initializers;
+
+    // Identify large initializers that need IRPA parameter backing.
+    for (size_t i = 0; i < initializers_.size(); ++i) {
+      auto tensor_info =
+          initializers_[i].TypeInfo().GetTensorTypeAndShapeInfo();
+      size_t byte_size = tensor_info.GetElementCount() *
+                         OnnxElementTypeSize(tensor_info.GetElementType());
+      if (byte_size > kMaxInlineInitializerSize) {
+        parameter_initializers_.push_back(
+            {SanitizeName(initializers_[i].GetName()), i});
+      }
+    }
+
+    // Collect symbolic dimension names for graph inputs and outputs.
+    // These are used for dim spec matching (static specialization and
+    // divisibility constraints).
+    for (const auto& input : graph_inputs_) {
+      if (input.TypeInfo().GetONNXType() != ONNX_TYPE_TENSOR) {
+        input_symbolic_dims_.emplace_back();
+        continue;
+      }
+      input_symbolic_dims_.push_back(
+          input.TypeInfo().GetTensorTypeAndShapeInfo().GetSymbolicDimensions());
+    }
+    for (const auto& output : graph_outputs_) {
+      if (output.TypeInfo().GetONNXType() != ONNX_TYPE_TENSOR) {
+        output_symbolic_dims_.emplace_back();
+        continue;
+      }
+      output_symbolic_dims_.push_back(output.TypeInfo()
+                                          .GetTensorTypeAndShapeInfo()
+                                          .GetSymbolicDimensions());
+    }
   }
 
-  void EmitModuleHeader() {
-    // Build function arguments.
+  // Configures the generator for a variant (dim specs, function name suffix).
+  // Must be called before EmitFunctionHeader/EmitFunctionBody for each variant.
+  void ConfigureForVariant(const DimSpecVariant& specs,
+                           const std::string& suffix) {
+    dim_specs_ = specs;
+    static_specs_.clear();
+    specialized_types_.clear();
+    for (const auto& spec : dim_specs_) {
+      if (spec.kind == DimSpec::Kind::kStatic) {
+        static_specs_[spec.symbolic_name] = &spec;
+      }
+    }
+    graph_name_ = SanitizeName(graph_.GetName());
+    if (graph_name_.empty()) graph_name_ = "main";
+    graph_name_ += suffix;
+  }
+
+  // Emits the function signature with current dim specs and function name.
+  void EmitFunctionHeader() {
+    // Build function arguments (apply static specialization to signature).
+    // Also populate specialized_types_ so node emissions use consistent types.
     std::ostringstream args;
     for (size_t i = 0; i < graph_inputs_.size(); ++i) {
       if (i > 0) {
         args << ", ";
       }
       std::string name = SanitizeName(graph_inputs_[i].GetName());
-      std::string type = FormatTensorType(graph_inputs_[i].TypeInfo());
+      std::string type = FormatTensorType(
+          graph_inputs_[i].TypeInfo(), static_specs_, input_symbolic_dims_[i]);
       args << "%" << name << ": " << type;
+      if (!static_specs_.empty()) {
+        specialized_types_[name] = type;
+      }
     }
 
-    // Build return types.
+    // Build return types (apply static specialization to signature).
     std::ostringstream ret_types;
     for (size_t i = 0; i < graph_outputs_.size(); ++i) {
       if (i > 0) {
         ret_types << ", ";
       }
-      ret_types << FormatTensorType(graph_outputs_[i].TypeInfo());
+      std::string out_name = SanitizeName(graph_outputs_[i].GetName());
+      std::string type =
+          FormatTensorType(graph_outputs_[i].TypeInfo(), static_specs_,
+                           output_symbolic_dims_[i]);
+      ret_types << type;
+      if (!static_specs_.empty()) {
+        specialized_types_[out_name] = type;
+      }
     }
 
-    constexpr std::string_view schema = R"(module {{
-  func.func @{0}({1}) -> ({2})
+    constexpr std::string_view schema = R"(  func.func @{0}({1}) -> ({2})
       attributes {{
         torch.onnx_meta.ir_version = {3} : si64,
         torch.onnx_meta.opset_version = {4} : si64,
@@ -296,9 +396,12 @@ class MlirGenerator {
   }
 
   void EmitFunctionBody() {
+    // Emit divisibility constraints (torch.symbolic_int + bind_symbolic_shape).
+    EmitDivisibilityConstraints();
+
     // Emit initializers as flow.tensor.constant ops.
-    for (size_t i = 0; i < initializers_.size(); ++i) {
-      EmitInitializer(initializers_[i], i);
+    for (const auto& init : initializers_) {
+      EmitInitializer(init);
     }
 
     // Emit nodes.
@@ -326,7 +429,7 @@ class MlirGenerator {
   //       #flow.parameter.named<"model"::"name"> : tensor<...>
   //   %name = torch_c.from_builtin_tensor %__raw_name : tensor<...>
   //       -> !torch.vtensor<[...],dtype>
-  void EmitInitializer(const Ort::ConstValueInfo& init, size_t init_index) {
+  void EmitInitializer(const Ort::ConstValueInfo& init) {
     std::string name = SanitizeName(init.GetName());
     std::string vtensor_type = FormatTensorType(init.TypeInfo());
     std::string tensor_type = FormatMlirTensorType(init.TypeInfo());
@@ -335,31 +438,30 @@ class MlirGenerator {
     size_t byte_size = tensor_info.GetElementCount() *
                        OnnxElementTypeSize(tensor_info.GetElementType());
 
-    if (byte_size <= kMaxInlineInitializerSize) {
-      // Small: inline with dense<> DenseElementsAttr.
-      Ort::ConstValue tensor_value{nullptr};
-      auto status = init.GetInitializer(tensor_value);
-      if (!status.IsOK()) {
-        return;
-      }
-      const auto* data =
-          static_cast<const uint8_t*>(tensor_value.GetTensorRawData());
-      std::string hex = HexEncode(data, tensor_value.GetTensorSizeInBytes());
-
-      constexpr std::string_view schema =
-          R"(    %__raw_{0} = flow.tensor.constant dense<"{3}"> : {1}
-    %{0} = torch_c.from_builtin_tensor %__raw_{0} : {1} -> {2}
-)";
-      out_ << std::format(schema, name, tensor_type, vtensor_type, hex);
-    } else {
-      // Large: parameter reference. Data stored in IRPA archive.
+    if (byte_size > kMaxInlineInitializerSize) {
+      // Large: reference IRPA parameter archive.
       constexpr std::string_view schema =
           R"(    %__raw_{0} = flow.tensor.constant #flow.parameter.named<"model"::"{0}"> : {1}
     %{0} = torch_c.from_builtin_tensor %__raw_{0} : {1} -> {2}
 )";
       out_ << std::format(schema, name, tensor_type, vtensor_type);
-      parameter_initializers_.push_back({name, init_index});
+      return;
     }
+
+    // Small: inline with dense<> DenseElementsAttr.
+    Ort::ConstValue tensor_value{nullptr};
+    auto status = init.GetInitializer(tensor_value);
+    if (!status.IsOK()) return;
+
+    const auto* data =
+        static_cast<const uint8_t*>(tensor_value.GetTensorRawData());
+    std::string hex = HexEncode(data, tensor_value.GetTensorSizeInBytes());
+
+    constexpr std::string_view schema =
+        R"(    %__raw_{0} = flow.tensor.constant dense<"{3}"> : {1}
+    %{0} = torch_c.from_builtin_tensor %__raw_{0} : {1} -> {2}
+)";
+    out_ << std::format(schema, name, tensor_type, vtensor_type, hex);
   }
 
   void EmitNode(const Ort::ConstNode& node) {
@@ -375,12 +477,10 @@ class MlirGenerator {
     size_t valid_output_count = 0;
     for (size_t i = 0; i < outputs.size(); ++i) {
       if (!outputs[i]) {
-        // Skip invalid outputs (optional outputs can be empty/null).
         continue;
       }
       std::string output_name = outputs[i].GetName();
       if (output_name.empty()) {
-        // Skip empty outputs.
         continue;
       }
       if (!first_output) {
@@ -389,8 +489,17 @@ class MlirGenerator {
       }
       first_output = false;
       valid_output_count++;
-      out_names << "%" << SanitizeName(output_name);
-      out_types << FormatTensorType(outputs[i].TypeInfo());
+      std::string sanitized = SanitizeName(output_name);
+      out_names << "%" << sanitized;
+
+      // If a node output corresponds to a graph output with a specialized type,
+      // use the specialized type to maintain SSA type consistency.
+      auto it = specialized_types_.find(sanitized);
+      if (it != specialized_types_.end()) {
+        out_types << it->second;
+      } else {
+        out_types << FormatTensorType(outputs[i].TypeInfo());
+      }
     }
 
     // Build input SSA references.
@@ -399,7 +508,6 @@ class MlirGenerator {
     bool first_input = true;
     for (size_t i = 0; i < inputs.size(); ++i) {
       if (!inputs[i]) {
-        // Skip invalid inputs (optional inputs can be empty/null).
         continue;
       }
       std::string input_name = inputs[i].GetName();
@@ -411,8 +519,17 @@ class MlirGenerator {
         in_types << ", ";
       }
       first_input = false;
-      in_names << "%" << SanitizeName(input_name);
-      in_types << FormatTensorType(inputs[i].TypeInfo());
+      std::string sanitized = SanitizeName(input_name);
+      in_names << "%" << sanitized;
+
+      // If a node input references a graph input with a specialized type,
+      // use the specialized type to maintain SSA type consistency.
+      auto it = specialized_types_.find(sanitized);
+      if (it != specialized_types_.end()) {
+        in_types << it->second;
+      } else {
+        in_types << FormatTensorType(inputs[i].TypeInfo());
+      }
     }
 
     // Build attributes.
@@ -495,22 +612,154 @@ class MlirGenerator {
         ret_types << ", ";
       }
       ret_values << "%" << SanitizeName(graph_outputs_[i].GetName());
-      ret_types << FormatTensorType(graph_outputs_[i].TypeInfo());
+      ret_types << FormatTensorType(graph_outputs_[i].TypeInfo(), static_specs_,
+                                    output_symbolic_dims_[i]);
     }
 
     out_ << std::format("    return {0} : {1}\n", ret_values.str(),
                         ret_types.str());
   }
 
-  void EmitModuleFooter() {
-    out_ << "  }\n";
-    out_ << "}\n";
+  // Emits torch.symbolic_int and torch.bind_symbolic_shape ops for
+  // kDivisibleBy dim specs. This tells the compiler that certain dynamic
+  // dimensions are multiples of a given divisor.
+  void EmitDivisibilityConstraints() {
+    // Build divisor lookup: symbolic_name -> divisor value.
+    std::unordered_map<std::string, int64_t> divisors;
+    for (const auto& spec : dim_specs_) {
+      if (spec.kind == DimSpec::Kind::kDivisibleBy)
+        divisors[spec.symbolic_name] = spec.value;
+    }
+    if (divisors.empty()) return;
+
+    // True if dim d of an input is dynamic with a symbolic name.
+    auto is_named_dynamic = [](int64_t shape_d, const auto& sym_dims,
+                               size_t d) {
+      return shape_d < 0 && d < sym_dims.size() && sym_dims[d] &&
+             sym_dims[d][0] != '\0';
+    };
+
+    // Each unique symbolic dim gets a torch.symbolic_int declaration.
+    // Constrained dims are registered first for deterministic ordering.
+    struct Symbol {
+      std::string label;
+      int64_t divisor;  // 0 = unconstrained, >0 = divisibility
+    };
+    std::vector<Symbol> symbols;
+    std::unordered_map<std::string, size_t> sym_index;
+
+    auto register_sym = [&](const std::string& name, int64_t divisor) {
+      if (auto [it, ok] = sym_index.try_emplace(name, symbols.size()); ok)
+        symbols.push_back({"s_" + SanitizeName(name), divisor});
+    };
+
+    for (const auto& [name, divisor] : divisors) register_sym(name, divisor);
+
+    for (size_t i = 0; i < graph_inputs_.size(); ++i) {
+      if (graph_inputs_[i].TypeInfo().GetONNXType() != ONNX_TYPE_TENSOR)
+        continue;
+      auto shape =
+          graph_inputs_[i].TypeInfo().GetTensorTypeAndShapeInfo().GetShape();
+      const auto& sym_dims = input_symbolic_dims_[i];
+      for (size_t d = 0; d < shape.size(); ++d) {
+        if (!is_named_dynamic(shape[d], sym_dims, d)) continue;
+        if (!static_specs_.contains(sym_dims[d])) register_sym(sym_dims[d], 0);
+      }
+    }
+
+    // Emit torch.symbolic_int declarations.
+    for (size_t i = 0; i < symbols.size(); ++i) {
+      out_ << std::format(
+          "    %_sym_{0} = torch.symbolic_int \"{1}\" "
+          "{{min_val = 1, max_val = 9223372036854775807}} : !torch.int\n",
+          i, symbols[i].label);
+    }
+
+    // For each graph input, emit torch.bind_symbolic_shape with an affine map
+    // that relates each dynamic dim to its symbolic parameter.
+    for (size_t i = 0; i < graph_inputs_.size(); ++i) {
+      if (graph_inputs_[i].TypeInfo().GetONNXType() != ONNX_TYPE_TENSOR)
+        continue;
+      auto shape =
+          graph_inputs_[i].TypeInfo().GetTensorTypeAndShapeInfo().GetShape();
+      const auto& sym_dims = input_symbolic_dims_[i];
+
+      // Single pass: collect referenced symbols and build per-dim expressions.
+      std::vector<size_t> referenced;
+      std::unordered_map<std::string, size_t> local_idx;
+      std::vector<std::string> dim_exprs;
+
+      auto get_local = [&](const std::string& name) -> size_t {
+        auto [it, ok] = local_idx.try_emplace(name, referenced.size());
+        if (ok) referenced.push_back(sym_index[name]);
+        return it->second;
+      };
+
+      for (size_t d = 0; d < shape.size(); ++d) {
+        if (shape[d] >= 0) {
+          dim_exprs.push_back(std::to_string(shape[d]));
+          continue;
+        }
+        if (!is_named_dynamic(shape[d], sym_dims, d)) {
+          std::string anon = std::format("__anon_{}_d{}", i, d);
+          register_sym(anon, 0);
+          dim_exprs.push_back(std::format("s{}", get_local(anon)));
+          continue;
+        }
+        std::string name = sym_dims[d];
+        if (auto it = static_specs_.find(name); it != static_specs_.end()) {
+          dim_exprs.push_back(std::to_string(it->second->value));
+          continue;
+        }
+        size_t idx = get_local(name);
+        int64_t div = symbols[referenced[idx]].divisor;
+        dim_exprs.push_back(div > 0 ? std::format("s{} * {}", idx, div)
+                                    : std::format("s{}", idx));
+      }
+      if (referenced.empty()) continue;
+
+      // Build affine_map and emit.
+      std::string params, exprs, sym_refs;
+      for (size_t j = 0; j < referenced.size(); ++j) {
+        if (j) params += ", ";
+        params += std::format("s{}", j);
+      }
+      for (size_t j = 0; j < dim_exprs.size(); ++j) {
+        if (j) exprs += ", ";
+        exprs += dim_exprs[j];
+      }
+      for (size_t j = 0; j < referenced.size(); ++j) {
+        if (j) sym_refs += ", ";
+        sym_refs += std::format("%_sym_{}", referenced[j]);
+      }
+
+      std::string input_name = SanitizeName(graph_inputs_[i].GetName());
+      auto spec_it = specialized_types_.find(input_name);
+      std::string vtensor_type =
+          spec_it != specialized_types_.end()
+              ? spec_it->second
+              : FormatTensorType(graph_inputs_[i].TypeInfo());
+
+      out_ << std::format(
+          "    torch.bind_symbolic_shape %{0}, [{1}], "
+          "affine_map<()[{2}] -> ({3})> : {4}\n",
+          input_name, sym_refs, params, exprs, vtensor_type);
+    }
   }
 
   // Member variables.
   const Ort::ConstGraph& graph_;
   std::ostream& out_;
   std::string irpa_path_;
+  DimSpecVariant dim_specs_;
+
+  // Lookup map: symbolic_name -> DimSpec* for kStatic specs.
+  std::unordered_map<std::string, const DimSpec*> static_specs_;
+
+  // Map from sanitized SSA name -> specialized vtensor type string.
+  // Populated in EmitFunctionHeader for graph inputs/outputs that have static
+  // specializations. Used by EmitNode to maintain SSA type consistency.
+  std::unordered_map<std::string, std::string> specialized_types_;
 
   std::string graph_name_;
   int64_t ir_version_ = 8;
@@ -520,6 +769,11 @@ class MlirGenerator {
   std::vector<Ort::ConstValueInfo> graph_outputs_;
   std::vector<Ort::ConstValueInfo> initializers_;
   std::vector<ParameterInitializer> parameter_initializers_;
+
+  // Symbolic dimension names per graph input/output (parallel to
+  // graph_inputs_/graph_outputs_).
+  std::vector<std::vector<const char*>> input_symbolic_dims_;
+  std::vector<std::vector<const char*>> output_symbolic_dims_;
 };
 
 // Builds an IRPA parameter archive for large initializers.
@@ -652,11 +906,12 @@ OrtStatus* MlirGenerator::BuildParameterArchive(
 
 }  // namespace
 
-OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& /*ort_api*/,
-                        const std::string& mlir_path,
-                        const std::string& irpa_path,
-                        ParameterIndexPtr& out_index,
-                        ParameterProviderPtr& out_provider) {
+OrtStatus* GenerateMlir(
+    const Ort::ConstGraph& graph, const OrtApi& /*ort_api*/,
+    const std::string& mlir_path, const std::string& irpa_path,
+    const std::vector<std::pair<std::string, DimSpecVariant>>& variants,
+    std::vector<std::string>& out_function_names, ParameterIndexPtr& out_index,
+    ParameterProviderPtr& out_provider) {
   std::ofstream file(mlir_path);
   if (!file.is_open()) {
     return Ort::Status(
@@ -666,7 +921,13 @@ OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& /*ort_api*/,
   }
 
   MlirGenerator gen(graph, file, irpa_path);
-  gen.Generate();
+
+  std::vector<MlirGenerator::VariantInfo> infos;
+  infos.reserve(variants.size());
+  for (const auto& [suffix, specs] : variants) {
+    infos.push_back({suffix, &specs});
+  }
+  out_function_names = gen.Generate(infos);
 
   file.close();
   if (file.fail()) {
