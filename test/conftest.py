@@ -226,7 +226,10 @@ def try_compile(model, device, kernel_dir, target_arch):
         pathlib.Path(model_path).unlink(missing_ok=True)
 
 
-def try_generate_mlir(model, device, kernel_dir, target_arch, assert_compiles=False):
+def try_generate_mlir(
+    model, device, kernel_dir, target_arch, extra_provider_options=None,
+    assert_compiles=False,
+):
     """Generate MLIR for a model via the EP. Returns (mlir_str, error_msg).
 
     Uses save_intermediates to keep the MLIR file that the EP writes before
@@ -255,11 +258,11 @@ def try_generate_mlir(model, device, kernel_dir, target_arch, assert_compiles=Fa
 
     # Use a private temp directory so the EP's TempFile (which reads
     # std::filesystem::temp_directory_path()) writes only here.
-    # On POSIX this reads TMPDIR; on Windows it reads TMP/TEMP.
+    # On POSIX this reads TMPDIR; on Windows it reads TMP then TEMP.
     private_tmp = tempfile.mkdtemp(prefix="iree_ep_test_")
-    _tmp_vars = ["TMPDIR", "TMP", "TEMP"]
-    _old_tmp = {v: os.environ.get(v) for v in _tmp_vars}
-    for v in _tmp_vars:
+    temp_vars = ("TMPDIR", "TMP", "TEMP")
+    old_temp_env = {v: os.environ.get(v) for v in temp_vars}
+    for v in temp_vars:
         os.environ[v] = private_tmp
 
     err = None
@@ -270,6 +273,8 @@ def try_generate_mlir(model, device, kernel_dir, target_arch, assert_compiles=Fa
             "extern_kernel_path": kernel_dir,
             "save_intermediates": "1",
         }
+        if extra_provider_options:
+            provider_options.update(extra_provider_options)
         sess_options.add_provider_for_devices([device], provider_options)
         ort.InferenceSession(model_path, sess_options=sess_options)
         # Session succeeded -- MLIR gen worked and iree-compile worked.
@@ -277,9 +282,9 @@ def try_generate_mlir(model, device, kernel_dir, target_arch, assert_compiles=Fa
         err = str(e)
     finally:
         # Restore temp env vars immediately.
-        for v in _tmp_vars:
-            if _old_tmp[v] is not None:
-                os.environ[v] = _old_tmp[v]
+        for v in temp_vars:
+            if old_temp_env[v] is not None:
+                os.environ[v] = old_temp_env[v]
             else:
                 os.environ.pop(v, None)
         pathlib.Path(model_path).unlink(missing_ok=True)

@@ -24,7 +24,10 @@
 #define ONNXRUNTIME_EP_IREE_SRC_MLIR_GEN_H_
 
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "dim_spec.h"
 #include "iree_wrappers.h"
 #include "ort_import.h"
 
@@ -45,19 +48,31 @@ struct TargetConfig {
                              const std::string& backend);
 };
 
-// Generates MLIR text from an OrtGraph and writes it to the specified file.
+// Generates an MLIR module from an OrtGraph and writes it to the specified
+// file. The module contains one function per variant. Each variant is a
+// (function_name_suffix, dim_specs) pair controlling dimension specialization:
+// - Range-only specs (div == 0) emit util.assume.int with umin/umax.
+// - Range+div specs (div > 0) emit util.assume.int with umin/umax/udiv.
+//   Function signatures remain generic (dynamic dims stay as ?).
+// For the unspecialized case, pass a single variant with empty suffix/specs:
+//   {{"", {}}}
+//
+// out_function_names is populated with the MLIR function name for each variant
+// (parallel to the input `variants` vector). The caller should prepend
+// "module." to look up functions in the compiled VMFB.
+//
 // Small initializers are inlined in the MLIR. Large initializers are emitted as
 // parameter references and their data is written to an IRPA archive at
 // irpa_path. out_index and out_provider are populated with the parameter index
 // and provider for the archive. They remain null if no parameters are needed.
 // com.iree:ExternDispatch nodes are emitted as hal.dispatch.extern ops using
 // the target info from target_config.
-OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& ort_api,
-                        const std::string& mlir_path,
-                        const std::string& irpa_path,
-                        ParameterIndexPtr& out_index,
-                        ParameterProviderPtr& out_provider,
-                        TargetConfig target_config);
+OrtStatus* GenerateMlir(
+    const Ort::ConstGraph& graph, const OrtApi& ort_api,
+    const std::string& mlir_path, const std::string& irpa_path,
+    const std::vector<std::pair<std::string, DimSpecVariant>>& variants,
+    std::vector<std::string>& out_function_names, ParameterIndexPtr& out_index,
+    ParameterProviderPtr& out_provider, TargetConfig target_config);
 
 }  // namespace onnxruntime::iree
 

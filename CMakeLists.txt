@@ -136,6 +136,7 @@ add_library(onnxruntime_ep_iree SHARED
   src/plugin_entry.cc
   src/iree_ep_factory.cc
   src/iree_ep.cc
+  src/dim_spec.cc
   src/iree_compile.cc
   src/mlir_gen.cc
   src/iree_ort_utils.cc

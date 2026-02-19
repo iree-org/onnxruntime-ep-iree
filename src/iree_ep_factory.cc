@@ -414,6 +414,13 @@ OrtStatus* ORT_API_CALL IreeEpFactory::CreateEpImpl(
                                           "0") == "1";
     config.extern_kernel_path =
         sess_opts.GetConfigEntryOrDefault("ep.iree.extern_kernel_path", "");
+
+    std::string dim_specs_str =
+        sess_opts.GetConfigEntryOrDefault("ep.iree.dim_specs", "");
+    if (!dim_specs_str.empty()) {
+      ORT_RETURN_IF_ERROR(
+          ParseDimSpecs(dim_specs_str, config.dim_spec_variants));
+    }
   }
 
   // Select backend based on driver.
