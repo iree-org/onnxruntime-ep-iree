@@ -25,7 +25,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ninja-build
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt numpy
+        run: pip install -r requirements.txt
 
       - name: CMake - configure
         run: cmake -G Ninja -B ${BUILD_DIR} -DCMAKE_BUILD_TYPE=Release
@@ -39,8 +39,4 @@ jobs:
             pip install -e python/
 
       - name: Run tests
-        run: |
-          cd test
-          python test_ep_load.py
-          python test_initializers.py
-          python test_save_intermediates.py
+        run: pytest test/ -v

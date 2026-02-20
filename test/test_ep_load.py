@@ -1,27 +1,16 @@
-#!/usr/bin/env python3
 """Test that the IREE ONNX Runtime EP loads and runs correctly."""
 
 import pathlib
-import sys
+import tempfile
 
 import numpy as np
+import onnx
+import onnxruntime as ort
 from onnx import TensorProto, helper
 
-import test_utils
 
-
-def test_ep_load():
+def test_ep_load(iree_device):
     """Test that the IREE EP plugin loads and runs inference correctly."""
-
-    device = test_utils.get_iree_device("local-task")
-    if not device:
-        print("ERROR: IREE EP not found in EP devices")
-        return False
-
-    print(f"IREE EP available (vendor={device.ep_vendor})")
-    print(f"  Device metadata: {device.device.metadata}")
-    print(f"  Device type: {device.device.type}")
-
     # Create a simple Add model: C = A + D (constant).
     a = np.float32(np.random.rand(64, 64))
     b = np.float32(np.random.rand(64, 64))
@@ -49,37 +38,22 @@ def test_ep_load():
     )
     model.ir_version = 8
 
-    model_path = test_utils.save_model(model)
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as f:
+        onnx.save(model, f.name)
+        model_path = f.name
+
     try:
-        session = test_utils.create_session(model_path, device, {"target_arch": "host"})
+        opts = ort.SessionOptions()
+        opts.add_provider_for_devices([iree_device], {"target_arch": "host"})
+        session = ort.InferenceSession(model_path, sess_options=opts)
 
         expected = a + b
         outputs = session.run(None, {"A": a})
         result = outputs[0]
 
-        if result.shape != expected.shape:
-            print(f"FAIL: Shape mismatch: {result.shape} vs {expected.shape}")
-            return False
-
-        if not np.allclose(result, expected, rtol=1e-5, atol=1e-5):
-            print(f"FAIL: Values mismatch")
-            print(f"  Expected: {expected}")
-            print(f"  Got: {result}")
-            return False
-
-        print("Inference output verified!")
-        print(f"  Input A: {a.flatten()[:4]}...")
-        print(f"  Input B: {b.flatten()[:4]}...")
-        print(f"  Output:  {result.flatten()[:4]}...")
-
+        assert result.shape == expected.shape, (
+            f"Shape mismatch: {result.shape} vs {expected.shape}"
+        )
+        np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-5)
     finally:
         pathlib.Path(model_path).unlink()
-
-    print("\n=== Test PASSED ===")
-    return True
-
-
-if __name__ == "__main__":
-    test_utils.register_ep()
-    success = test_ep_load()
-    sys.exit(0 if success else 1)

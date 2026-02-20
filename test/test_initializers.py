@@ -1,18 +1,15 @@
-#!/usr/bin/env python3
 """Test initializer handling: small inline, large IRPA parameter, and external."""
 
 import glob
 import os
-import sys
 import tempfile
 
 import numpy as np
 import onnx
+import onnxruntime as ort
 from onnx import TensorProto, helper
 from onnx.external_data_helper import set_external_data
 from onnx.numpy_helper import from_array
-
-import test_utils
 
 # Fixed seed for reproducibility.
 np.random.seed(42)
@@ -32,7 +29,7 @@ B_EXT_SMALL = np.random.rand(1, 64).astype(np.float32)
 EXPECTED = (((A_DATA + B_SMALL) + B_LARGE) + B_EXT) + B_EXT_SMALL
 
 
-def create_model():
+def _create_model():
     """Create the test model and return (model_path, model_dir).
 
     Caller must clean up model_dir when done.
@@ -114,13 +111,13 @@ def create_model():
     return model_path, model_dir
 
 
-def cleanup_model_dir(model_dir):
+def _cleanup_model_dir(model_dir):
     for f in os.listdir(model_dir):
         os.remove(os.path.join(model_dir, f))
     os.rmdir(model_dir)
 
 
-def get_iree_files():
+def _get_iree_files():
     """Return current sets of IREE temp MLIR and IRPA files."""
     temp_dir = tempfile.gettempdir()
     mlir = set(glob.glob(os.path.join(temp_dir, "iree_ep_*.mlir")))
@@ -128,7 +125,7 @@ def get_iree_files():
     return mlir, irpa
 
 
-def cleanup_iree_files(new_mlir, new_irpa):
+def _cleanup_iree_files(new_mlir, new_irpa):
     """Remove IREE temp files (MLIR, IRPA, VMFB)."""
     for f in new_mlir | new_irpa:
         try:
@@ -143,144 +140,77 @@ def cleanup_iree_files(new_mlir, new_irpa):
             pass
 
 
-def test_with_save_intermediates():
+def test_with_save_intermediates(iree_device):
     """Run with save_intermediates=1 and validate MLIR, IRPA, and inference."""
-    print("\n=== test_with_save_intermediates ===")
-
-    device = test_utils.get_iree_device()
-    if not device:
-        print("ERROR: IREE device not found")
-        return False
-
-    model_path, model_dir = create_model()
-    mlir_before, irpa_before = get_iree_files()
+    model_path, model_dir = _create_model()
+    mlir_before, irpa_before = _get_iree_files()
 
     try:
-        session = test_utils.create_session(
-            model_path,
-            device,
-            {"target_arch": "host", "save_intermediates": "1"},
+        opts = ort.SessionOptions()
+        opts.add_provider_for_devices(
+            [iree_device], {"target_arch": "host", "save_intermediates": "1"}
         )
+        session = ort.InferenceSession(model_path, sess_options=opts)
         result = session.run(None, {"A": A_DATA})[0]
 
-        if not np.allclose(result, EXPECTED, rtol=1e-5, atol=1e-5):
-            print("FAIL: Values mismatch")
-            return False
-        print("  Inference result correct")
+        np.testing.assert_allclose(result, EXPECTED, rtol=1e-5, atol=1e-5)
 
         # Validate generated MLIR.
-        mlir_after, irpa_after = get_iree_files()
+        mlir_after, irpa_after = _get_iree_files()
         new_mlir = mlir_after - mlir_before
         new_irpa = irpa_after - irpa_before
 
-        if not new_mlir:
-            print("FAIL: No MLIR file saved")
-            return False
+        assert new_mlir, "No MLIR file saved"
 
         mlir_content = open(list(new_mlir)[0]).read()
 
         # D_small and D_ext_small should be inlined via dense<>.
-        if 'dense<"0x' not in mlir_content:
-            print("FAIL: MLIR should contain inline dense<> attributes")
-            return False
-        if "dense_resource" in mlir_content:
-            print("FAIL: MLIR should not contain dense_resource (replaced by dense<>)")
-            return False
-        if "dialect_resources" in mlir_content:
-            print("FAIL: MLIR should not contain dialect_resources section")
-            return False
-        print("  Small inits (D_small, D_ext_small): inline dense<> present")
+        assert 'dense<"0x' in mlir_content, (
+            "MLIR should contain inline dense<> attributes"
+        )
+        assert "dense_resource" not in mlir_content, (
+            "MLIR should not contain dense_resource (replaced by dense<>)"
+        )
+        assert "dialect_resources" not in mlir_content, (
+            "MLIR should not contain dialect_resources section"
+        )
 
         # D_large and D_ext should use flow.parameter.named.
-        if 'flow.parameter.named<"model"::"D_large">' not in mlir_content:
-            print("FAIL: MLIR should contain flow.parameter.named for D_large")
-            return False
-        if 'flow.parameter.named<"model"::"D_ext">' not in mlir_content:
-            print("FAIL: MLIR should contain flow.parameter.named for D_ext")
-            return False
+        assert 'flow.parameter.named<"model"::"D_large">' in mlir_content, (
+            "MLIR should contain flow.parameter.named for D_large"
+        )
+        assert 'flow.parameter.named<"model"::"D_ext">' in mlir_content, (
+            "MLIR should contain flow.parameter.named for D_ext"
+        )
         # D_ext_small should NOT be a parameter.
-        if 'flow.parameter.named<"model"::"D_ext_small">' in mlir_content:
-            print("FAIL: D_ext_small should be inlined, not a parameter")
-            return False
-        print("  Large/external inits (D_large, D_ext): flow.parameter.named present")
+        assert 'flow.parameter.named<"model"::"D_ext_small">' not in mlir_content, (
+            "D_ext_small should be inlined, not a parameter"
+        )
 
         # IRPA should contain only D_large's data (16384 bytes + header),
         # not D_ext's. If D_ext were copied it would be >32000 bytes.
-        if not new_irpa:
-            print("FAIL: No IRPA file was created")
-            return False
+        assert new_irpa, "No IRPA file was created"
         irpa_size = os.path.getsize(list(new_irpa)[0])
-        if irpa_size == 0:
-            print("FAIL: IRPA should contain D_large data")
-            return False
-        if irpa_size > 20000:
-            print(
-                f"FAIL: IRPA too large ({irpa_size} bytes), "
-                f"external data may have been copied"
-            )
-            return False
-        print(f"  IRPA size: {irpa_size} bytes (D_large only, D_ext not copied)")
+        assert irpa_size > 0, "IRPA should contain D_large data"
+        assert irpa_size <= 20000, (
+            f"IRPA too large ({irpa_size} bytes), external data may have been copied"
+        )
 
-        cleanup_iree_files(new_mlir, new_irpa)
-        print("PASS")
-        return True
+        _cleanup_iree_files(new_mlir, new_irpa)
     finally:
-        cleanup_model_dir(model_dir)
+        _cleanup_model_dir(model_dir)
 
 
-def test_without_save_intermediates():
+def test_without_save_intermediates(iree_device):
     """Run without save_intermediates and validate inference."""
-    print("\n=== test_without_save_intermediates ===")
-
-    device = test_utils.get_iree_device()
-    if not device:
-        print("ERROR: IREE device not found")
-        return False
-
-    model_path, model_dir = create_model()
+    model_path, model_dir = _create_model()
 
     try:
-        session = test_utils.create_session(model_path, device, {"target_arch": "host"})
+        opts = ort.SessionOptions()
+        opts.add_provider_for_devices([iree_device], {"target_arch": "host"})
+        session = ort.InferenceSession(model_path, sess_options=opts)
         result = session.run(None, {"A": A_DATA})[0]
 
-        if not np.allclose(result, EXPECTED, rtol=1e-5, atol=1e-5):
-            print("FAIL: Values mismatch")
-            return False
-
-        print("  Inference result correct")
-        print("PASS")
-        return True
+        np.testing.assert_allclose(result, EXPECTED, rtol=1e-5, atol=1e-5)
     finally:
-        cleanup_model_dir(model_dir)
-
-
-def main():
-    """Run all initializer tests."""
-    print("Testing initializer handling (inline, IRPA parameter, external)")
-    print("=" * 60)
-
-    test_utils.register_ep()
-
-    results = []
-    results.append(("with_save_intermediates", test_with_save_intermediates()))
-    results.append(("without_save_intermediates", test_without_save_intermediates()))
-
-    print("\n" + "=" * 60)
-    print("Summary:")
-    all_passed = True
-    for name, passed in results:
-        status = "PASS" if passed else "FAIL"
-        print(f"  {name}: {status}")
-        if not passed:
-            all_passed = False
-
-    if all_passed:
-        print("\n=== All tests PASSED ===")
-        return 0
-    else:
-        print("\n=== Some tests FAILED ===")
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+        _cleanup_model_dir(model_dir)
