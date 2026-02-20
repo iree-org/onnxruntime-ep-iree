@@ -26,20 +26,21 @@ namespace onnxruntime::iree {
 
 // A single dimension constraint for specialization.
 struct DimSpec {
-  enum class Kind { kStatic, kDivisibleBy };
   std::string symbolic_name;
-  Kind kind;
-  int64_t value;  // Concrete value (kStatic) or divisor (kDivisibleBy).
+  int64_t min;  // Minimum value (inclusive), >= 0.
+  int64_t max;  // Maximum value (inclusive), >= min.
+  int64_t div;  // Divisibility constraint. 0 = none.
 };
 
 // A set of dimension constraints forming one specialization variant.
 using DimSpecVariant = std::vector<DimSpec>;
 
 // Parses the "ep.iree.dim_specs" session option string.
-// Format: "batch=1,seq=%16;batch=2,seq=%16"
-//   - Semicolons separate variants, commas separate specs within a variant,
-//     equals separates key from value. Values are integers (static dim) or
-//     %N (divisibility constraint).
+// Format: "batch(1,1), seq(0,131072,16); batch(1,1), seq(0,65536,8)"
+//   - name(min, max): range constraint. name(min, max, div): range +
+//     divisibility.
+//   - Static dims: min == max (e.g., batch(1,1)).
+//   - Semicolons separate variants; commas outside parentheses separate specs.
 // Returns nullptr on success (results written to `out`), or an OrtStatus* on
 // parse failure (e.g., invalid syntax, divisor <= 0).
 OrtStatus* ParseDimSpecs(const std::string& spec_str,
@@ -116,7 +117,7 @@ class IreeEp : public OrtEp, public ApiPtrs {
 
 // Compute kernel for compiled nodes.
 // Holds one or more IREE sessions/functions for compiled subgraph variants.
-// At runtime, dispatches to the most specific matching variant.
+// At runtime, dispatches to the first matching variant in user-provided order.
 struct IreeNodeComputeInfo : OrtNodeComputeInfo {
   // A single compiled variant (specialized or generic).
   struct Variant {
@@ -158,7 +159,8 @@ struct IreeNodeComputeInfo : OrtNodeComputeInfo {
   // Shared session owning the parameters module and all variant VMFBs.
   RuntimeSessionPtr session_;
 
-  // Variants sorted by specificity (most specific first, generic last).
+  // Variants in user-specified order (first match wins, generic last).
+  // Preserving caller order makes precedence explicit for overlapping specs.
   std::vector<Variant> variants_;
 
   // Mappings from symbolic names to input tensor positions for dispatch.

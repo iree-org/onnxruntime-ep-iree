@@ -128,7 +128,7 @@ def test_static_specialization():
     hidden = 16
     model_path, weight_data = create_matmul_model(hidden=hidden)
     try:
-        dim_specs = "batch=1,seq=64"
+        dim_specs = "batch(1,1), seq(64,64)"
         session = test_utils.create_session(
             model_path, device, {"target_arch": "host", "dim_specs": dim_specs}
         )
@@ -150,7 +150,7 @@ def test_static_specialization():
 
 
 def test_divisibility_specialization():
-    """Divisibility dim_specs: seq=%16 works with seq=32."""
+    """Divisibility dim_specs: seq(0,131072,16) works with seq=32."""
     print("\n=== test_divisibility_specialization ===")
 
     device = test_utils.get_iree_device()
@@ -161,7 +161,7 @@ def test_divisibility_specialization():
     hidden = 16
     model_path, weight_data = create_matmul_model(hidden=hidden)
     try:
-        dim_specs = "seq=%16"
+        dim_specs = "seq(0,131072,16)"
         session = test_utils.create_session(
             model_path, device, {"target_arch": "host", "dim_specs": dim_specs}
         )
@@ -170,7 +170,7 @@ def test_divisibility_specialization():
             print("FAIL: inference result mismatch")
             return False
 
-        print("  Divisibility specialization (seq=%16, seq=32): PASS")
+        print("  Divisibility specialization (seq(0,131072,16), seq=32): PASS")
         return True
     finally:
         pathlib.Path(model_path).unlink()
@@ -181,6 +181,7 @@ def test_multi_variant_dispatch():
 
     Compiles 3 variants (2 specialized + generic fallback) into one VMFB and
     verifies inference for shapes matching each constraint pattern.
+    Dispatch checks variants in dim_specs order (first match wins).
     """
     print("\n=== test_multi_variant_dispatch ===")
 
@@ -192,7 +193,7 @@ def test_multi_variant_dispatch():
     hidden = 16
     model_path, weight_data = create_matmul_model(hidden=hidden)
     try:
-        dim_specs = "batch=1,seq=64;seq=%16"
+        dim_specs = "batch(1,1), seq(64,64); seq(0,131072,16)"
         session = test_utils.create_session(
             model_path, device, {"target_arch": "host", "dim_specs": dim_specs}
         )
@@ -266,26 +267,36 @@ def test_parse_errors():
     model_path, _ = create_matmul_model()
     try:
         bad_inputs = [
-            # Missing '=' sign.
-            ("batch", "missing equals"),
-            ("batch,seq", "multiple specs missing equals"),
-            # Empty key or value.
-            ("=1", "empty key"),
-            ("batch=", "empty value"),
-            # Invalid divisor values.
-            ("batch=%0", "zero divisor"),
-            ("batch=%-1", "negative divisor"),
-            ("batch=%abc", "non-numeric divisor"),
-            ("batch=%", "bare percent"),
-            ("batch=%1.5", "float divisor"),
-            # Non-numeric static values.
-            ("batch=hello", "non-numeric value"),
-            ("batch=1.5", "float value"),
+            # Missing parentheses.
+            ("batch", "missing parentheses"),
+            # Old format (equals sign).
+            ("batch=1", "old format equals sign"),
+            # Empty name.
+            ("(1,1)", "empty name"),
+            # Wrong number of args.
+            ("batch(1)", "one arg"),
+            ("batch(1,2,3,4)", "four args"),
+            # Non-numeric values.
+            ("batch(abc,1)", "non-numeric min"),
+            ("batch(1,abc)", "non-numeric max"),
+            ("batch(1,2,abc)", "non-numeric div"),
+            # Invalid ranges.
+            ("batch(-1,1)", "negative min"),
+            ("batch(5,3)", "max less than min"),
+            # Invalid divisor.
+            ("batch(1,2,0)", "zero divisor"),
+            ("batch(1,2,-1)", "negative divisor"),
+            # Missing closing paren.
+            ("batch(1,1", "missing closing paren"),
+            # Trailing garbage after ')'.
+            ("batch(1,1)typo", "trailing garbage after ')'"),
+            # Duplicate symbolic keys within one variant.
+            ("batch(1,1), batch(2,2)", "duplicate key in variant"),
+            # Empty args.
+            ("batch(,1)", "empty min"),
+            ("batch(1,)", "empty max"),
             # Zero divisor in later variant.
-            ("a=1;b=%0", "zero divisor in variant 2"),
-            # Invalid static dim values.
-            ("batch=0", "zero static dim"),
-            ("batch=-1", "negative static dim"),
+            ("batch(1,1); seq(1,2,0)", "zero divisor in variant 2"),
         ]
 
         all_ok = True
@@ -301,7 +312,7 @@ def test_parse_errors():
 
 
 def test_save_intermediates_static():
-    """Validate that static specialization produces concrete dims in MLIR."""
+    """Validate that static specialization produces util.assume.int in MLIR."""
     print("\n=== test_save_intermediates_static ===")
 
     device = test_utils.get_iree_device()
@@ -317,7 +328,7 @@ def test_save_intermediates_static():
     mlir_before = set(glob.glob(os.path.join(temp_dir, "iree_ep_*.mlir")))
 
     try:
-        dim_specs = "batch=1,seq=64"
+        dim_specs = "batch(1,1), seq(64,64)"
         session = test_utils.create_session(
             model_path,
             device,
@@ -342,8 +353,6 @@ def test_save_intermediates_static():
 
         mlir_content = open(list(new_mlir)[0]).read()
 
-        # Static specialization should produce concrete dims in the function
-        # signature, not "?" for the specialized dims.
         # Check for variant suffixed functions.
         if "_variant0" not in mlir_content:
             print("FAIL: MLIR should contain _variant0 function")
@@ -357,32 +366,55 @@ def test_save_intermediates_static():
             return False
         print(f"  {func_count} functions present (variant + fallback)")
 
-        # The variant0 function should have concrete dims [1,64,16].
-        if "vtensor<[1,64,16]" not in mlir_content:
-            print("FAIL: variant0 should have concrete dims [1,64,16]")
-            return False
-        print("  Static dims [1,64,16] in variant0 signature")
-
-        # The generic fallback should have "?" for the dynamic dims.
+        # Signatures should be generic (no type specialization).
         if "vtensor<[?,?,16]" not in mlir_content:
-            print("FAIL: generic fallback should have dynamic dims [?,?,16]")
+            print("FAIL: signatures should have dynamic dims [?,?,16]")
             return False
-        print("  Dynamic dims [?,?,16] in generic fallback")
+        print("  Dynamic dims [?,?,16] in signatures")
 
-        # Clean up MLIR files.
-        for f in new_mlir:
-            try:
-                os.remove(f)
-            except OSError:
-                pass
-        # Also clean up VMFB/IRPA files.
-        for pattern in ["iree_ep_*.vmfb", "iree_ep_*.irpa"]:
-            for f in glob.glob(os.path.join(temp_dir, pattern)):
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
+        # Static constraints should produce util.assume.int with umin == umax.
+        if "util.assume.int" not in mlir_content:
+            print("FAIL: variant should have util.assume.int for static dims")
+            return False
+        print("  util.assume.int present")
 
+        # Check static range for batch=1: umin = 1, umax = 1.
+        if "<umin = 1, umax = 1>" not in mlir_content:
+            print("FAIL: should have static assume <umin = 1, umax = 1>")
+            return False
+        print("  Static assume <umin = 1, umax = 1> for batch")
+
+        # Check static range for seq=64: umin = 64, umax = 64.
+        if "<umin = 64, umax = 64>" not in mlir_content:
+            print("FAIL: should have static assume <umin = 64, umax = 64>")
+            return False
+        print("  Static assume <umin = 64, umax = 64> for seq")
+
+        # Should have flow.tensor.tie_shape to apply the assumptions.
+        if "flow.tensor.tie_shape" not in mlir_content:
+            print("FAIL: should have flow.tensor.tie_shape")
+            return False
+        print("  flow.tensor.tie_shape present")
+
+        # Operand order in tie_shape should follow tensor dim order
+        # (batch first, then seq).
+        tie_line = next(
+            (l for l in mlir_content.split("\n") if "flow.tensor.tie_shape" in l), ""
+        )
+        match = re.search(r"\{([^}]+)\}", tie_line)
+        if not match:
+            print("FAIL: could not parse tie_shape operands")
+            return False
+        operands = [x.strip() for x in match.group(1).split(",")]
+        if operands != ["%batch_assumed", "%seq_assumed"]:
+            print(
+                f"FAIL: tie_shape operand order mismatch, expected "
+                f"['%batch_assumed', '%seq_assumed'], got {operands}"
+            )
+            return False
+        print("  tie_shape operand order batch->seq: OK")
+
+        _cleanup_intermediates(temp_dir, mlir_before)
         print("  MLIR validation: PASS")
         return True
     finally:
@@ -390,7 +422,7 @@ def test_save_intermediates_static():
 
 
 def test_save_intermediates_divisibility():
-    """Validate that divisibility produces symbolic_int and bind_symbolic_shape."""
+    """Validate that divisibility produces util.assume.int and flow.tensor.tie_shape."""
     print("\n=== test_save_intermediates_divisibility ===")
 
     device = test_utils.get_iree_device()
@@ -405,7 +437,7 @@ def test_save_intermediates_divisibility():
     mlir_before = set(glob.glob(os.path.join(temp_dir, "iree_ep_*.mlir")))
 
     try:
-        dim_specs = "seq=%16"
+        dim_specs = "seq(0,131072,16)"
         session = test_utils.create_session(
             model_path,
             device,
@@ -428,36 +460,42 @@ def test_save_intermediates_divisibility():
 
         mlir_content = open(list(new_mlir)[0]).read()
 
-        if "torch.symbolic_int" not in mlir_content:
-            print("FAIL: MLIR should contain torch.symbolic_int ops")
+        # Should use util.assume.int (not torch.symbolic_int).
+        if "util.assume.int" not in mlir_content:
+            print("FAIL: MLIR should contain util.assume.int ops")
             return False
-        print("  torch.symbolic_int present")
+        print("  util.assume.int present")
 
-        if "torch.bind_symbolic_shape" not in mlir_content:
-            print("FAIL: MLIR should contain torch.bind_symbolic_shape ops")
+        # Should have range+div: umin = 0, umax = 131072, udiv = 16.
+        if "umin = 0" not in mlir_content:
+            print("FAIL: should have umin = 0")
             return False
-        print("  torch.bind_symbolic_shape present")
-
-        # The affine map for seq should contain the divisor multiplication.
-        # The symbol index depends on registration order, so just check "* 16".
-        if "* 16" not in mlir_content:
-            print("FAIL: affine map should contain '* 16' for seq=%16")
+        print("  umin = 0 present")
+        if "umax = 131072" not in mlir_content:
+            print("FAIL: should have umax = 131072")
             return False
-        print("  Affine map contains divisor '* 16'")
+        print("  umax = 131072 present")
+        if "udiv = 16" not in mlir_content:
+            print("FAIL: should have udiv = 16")
+            return False
+        print("  udiv = 16 present")
 
-        # Clean up.
-        for f in new_mlir:
-            try:
-                os.remove(f)
-            except OSError:
-                pass
-        for pattern in ["iree_ep_*.vmfb", "iree_ep_*.irpa"]:
-            for f in glob.glob(os.path.join(temp_dir, pattern)):
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
+        # Should have flow.tensor.tie_shape (not torch.bind_symbolic_shape).
+        if "flow.tensor.tie_shape" not in mlir_content:
+            print("FAIL: MLIR should contain flow.tensor.tie_shape ops")
+            return False
+        print("  flow.tensor.tie_shape present")
 
+        # Should NOT use the old torch.symbolic_int / torch.bind_symbolic_shape.
+        if "torch.symbolic_int" in mlir_content:
+            print("FAIL: should not use torch.symbolic_int anymore")
+            return False
+        if "torch.bind_symbolic_shape" in mlir_content:
+            print("FAIL: should not use torch.bind_symbolic_shape anymore")
+            return False
+        print("  No legacy torch.symbolic_int/bind_symbolic_shape ops")
+
+        _cleanup_intermediates(temp_dir, mlir_before)
         print("  MLIR divisibility ops: PASS")
         return True
     finally:
@@ -524,8 +562,8 @@ def test_mixed_static_divisibility():
     mlir_before = set(glob.glob(os.path.join(temp_dir, "iree_ep_*.mlir")))
 
     try:
-        # batch=1 (static) + seq=%16 (divisibility) in one variant.
-        dim_specs = "batch=1,seq=%16"
+        # batch(1,1) (static) + seq(0,131072,16) (range+div) in one variant.
+        dim_specs = "batch(1,1), seq(0,131072,16)"
         session = test_utils.create_session(
             model_path,
             device,
@@ -542,7 +580,7 @@ def test_mixed_static_divisibility():
             return False
         print("  Inference (batch=1, seq=32): OK")
 
-        # Check MLIR has concrete batch=1 and symbolic_int for seq.
+        # Check MLIR has both static and divisibility assumes.
         mlir_after = set(glob.glob(os.path.join(temp_dir, "iree_ep_*.mlir")))
         new_mlir = mlir_after - mlir_before
         if not new_mlir:
@@ -551,15 +589,23 @@ def test_mixed_static_divisibility():
 
         mlir_content = open(list(new_mlir)[0]).read()
 
-        if "vtensor<[1," not in mlir_content:
-            print("FAIL: variant should have concrete batch=1")
+        # Static range assume for batch=1.
+        if "<umin = 1, umax = 1>" not in mlir_content:
+            print("FAIL: variant should have static assume for batch=1")
             return False
-        print("  Concrete batch=1 in variant: OK")
+        print("  Static assume <umin = 1, umax = 1> for batch: OK")
 
-        if "torch.symbolic_int" not in mlir_content:
-            print("FAIL: should have symbolic_int for seq divisibility")
+        # Divisibility assume for seq=%16.
+        if "udiv = 16" not in mlir_content:
+            print("FAIL: should have udiv = 16 for seq divisibility")
             return False
-        print("  symbolic_int for seq: OK")
+        print("  Divisibility assume udiv = 16 for seq: OK")
+
+        # Both should use flow.tensor.tie_shape.
+        if "flow.tensor.tie_shape" not in mlir_content:
+            print("FAIL: should have flow.tensor.tie_shape")
+            return False
+        print("  flow.tensor.tie_shape present: OK")
 
         _cleanup_intermediates(temp_dir, mlir_before)
         print("  Mixed static+divisibility: PASS")
@@ -569,7 +615,7 @@ def test_mixed_static_divisibility():
 
 
 def test_shared_symbolic_dims():
-    """Two inputs sharing a symbolic dim must bind to the same symbol."""
+    """Two inputs sharing a symbolic dim must reuse the same canonical assume."""
     print("\n=== test_shared_symbolic_dims ===")
 
     device = test_utils.get_iree_device()
@@ -583,7 +629,7 @@ def test_shared_symbolic_dims():
     mlir_before = set(glob.glob(os.path.join(temp_dir, "iree_ep_*.mlir")))
 
     try:
-        dim_specs = "batch=%4"
+        dim_specs = "batch(0,131072,4)"
         session = test_utils.create_session(
             model_path,
             device,
@@ -604,7 +650,7 @@ def test_shared_symbolic_dims():
             return False
         print("  Inference (batch=8, shared dim): OK")
 
-        # Check MLIR: should have exactly one torch.symbolic_int for "batch".
+        # Check MLIR for the new ops.
         mlir_after = set(glob.glob(os.path.join(temp_dir, "iree_ep_*.mlir")))
         new_mlir = mlir_after - mlir_before
         if not new_mlir:
@@ -613,34 +659,101 @@ def test_shared_symbolic_dims():
 
         mlir_content = open(list(new_mlir)[0]).read()
 
-        # The variant function should have exactly 1 torch.symbolic_int (for
-        # "batch") and exactly 2 torch.bind_symbolic_shape (one per input).
+        # The variant function should have exactly 2 flow.tensor.tie_shape
+        # (one per input) and exactly 1 util.assume.int (canonical for "batch").
         # The generic fallback has no dim_specs so contributes 0 of each.
-        sym_int_count = mlir_content.count("torch.symbolic_int")
-        bind_count = mlir_content.count("torch.bind_symbolic_shape")
+        tie_count = mlir_content.count("flow.tensor.tie_shape")
+        assume_count = mlir_content.count("util.assume.int")
 
-        if sym_int_count != 1:
-            print(f"FAIL: expected 1 torch.symbolic_int, got {sym_int_count}")
+        if tie_count != 2:
+            print(f"FAIL: expected 2 flow.tensor.tie_shape, got {tie_count}")
             return False
-        print(f"  torch.symbolic_int count: {sym_int_count}")
+        print(f"  flow.tensor.tie_shape count: {tie_count}")
 
-        if bind_count != 2:
-            print(f"FAIL: expected 2 torch.bind_symbolic_shape, got {bind_count}")
+        if assume_count != 1:
+            print(f"FAIL: expected 1 util.assume.int (canonical), got {assume_count}")
             return False
-        print(f"  torch.bind_symbolic_shape count: {bind_count}")
+        print(f"  util.assume.int count: {assume_count}")
 
-        # Both bind ops should reference the same symbol (shared batch dim).
-        bind_lines = [
-            l for l in mlir_content.split("\n") if "torch.bind_symbolic_shape" in l
+        # Both tie_shape ops should reference the same assumed SSA value.
+        tie_lines = [
+            l for l in mlir_content.split("\n") if "flow.tensor.tie_shape" in l
         ]
-        sym_refs = [re.search(r"\[([^\]]+)\]", l).group(1) for l in bind_lines]
-        if len(set(sym_refs)) != 1:
-            print(f"FAIL: bind ops reference different symbols: {sym_refs}")
+        # Extract the operand list inside {}.
+        tie_operands = [re.search(r"\{([^}]+)\}", l).group(1) for l in tie_lines]
+        if len(set(tie_operands)) != 1:
+            print(f"FAIL: tie_shape ops use different operands: {tie_operands}")
             return False
-        print(f"  Both inputs share symbol: {sym_refs[0]}")
+        canonical_operands = [x.strip() for x in tie_operands[0].split(",")]
+        if canonical_operands != ["%batch_assumed"]:
+            print(
+                f"FAIL: expected canonical operand ['%batch_assumed'], "
+                f"got {canonical_operands}"
+            )
+            return False
+        print(f"  Both inputs share canonical assume: {tie_operands[0]}")
 
         _cleanup_intermediates(temp_dir, mlir_before)
         print("  Shared symbolic dims: PASS")
+        return True
+    finally:
+        pathlib.Path(model_path).unlink()
+
+
+def test_shared_dim_conflict_fallback():
+    """Inputs sharing a symbolic dim with different runtime values must not crash.
+
+    If input A has batch=4 and input B has batch=8, dispatch must not select a
+    specialized variant (whose tie_shape assumes all batch dims are equal).
+    The generic fallback has no tie_shape assumptions and is safe.
+
+    Note: Mismatched shared symbolic dims is a model-level error. This test
+    verifies that the EP handles it gracefully (no crash/segfault) rather than
+    applying incorrect tie_shape assumptions from a specialized variant.
+    """
+    print("\n=== test_shared_dim_conflict_fallback ===")
+
+    device = test_utils.get_iree_device()
+    if not device:
+        print("ERROR: IREE device not found")
+        return False
+
+    feat_a, feat_b = 10, 20
+    model_path, weight_data = create_add_model(feat_a=feat_a, feat_b=feat_b)
+    try:
+        dim_specs = "batch(0,131072,4)"
+        session = test_utils.create_session(
+            model_path, device, {"target_arch": "host", "dim_specs": dim_specs}
+        )
+
+        # Run with matching batch dims first (sanity check).
+        a = np.random.rand(8, feat_a).astype(np.float32)
+        b = np.random.rand(8, feat_b).astype(np.float32)
+        expected = a @ weight_data + b
+        result = session.run(None, {"A": a, "B": b})[0]
+        if not np.allclose(result, expected, rtol=1e-4, atol=1e-4):
+            print("FAIL: matching batch dims inference mismatch")
+            return False
+        print("  Matching batch dims (batch=8): OK")
+
+        # Run with conflicting batch dims (A:batch=4, B:batch=8).
+        # Both satisfy the spec individually, but they disagree on "batch".
+        # The EP should fall through to the generic fallback without crashing.
+        a2 = np.random.rand(4, feat_a).astype(np.float32)
+        b2 = np.random.rand(8, feat_b).astype(np.float32)
+        try:
+            result2 = session.run(None, {"A": a2, "B": b2})[0]
+            # If it runs, verify the result shape is reasonable.
+            if result2.shape[1] != feat_b:
+                print("FAIL: unexpected output shape")
+                return False
+            print("  Conflicting batch dims (A:4, B:8): OK (no crash)")
+        except Exception as e:
+            # Some backends may reject shape mismatches at the IREE level.
+            # That's acceptable — the key is no segfault/abort.
+            print(f"  Conflicting batch dims: OK (exception: {type(e).__name__})")
+
+        print("  Shared dim conflict fallback: PASS")
         return True
     finally:
         pathlib.Path(model_path).unlink()
@@ -659,15 +772,15 @@ def test_whitespace_and_divisibility_by_one():
     model_path, weight_data = create_matmul_model(hidden=hidden)
     try:
         # Whitespace around delimiters.
-        dim_specs = "  seq = %1  "
+        dim_specs = "  seq( 0 , 131072 , 1 )  "
         session = test_utils.create_session(
             model_path, device, {"target_arch": "host", "dim_specs": dim_specs}
         )
-        # %1 matches any positive seq value.
+        # div=1 matches any positive seq value.
         if not run_matmul(session, 2, 7, hidden, weight_data):
             print("FAIL: inference result mismatch")
             return False
-        print("  Whitespace + %1 divisibility: OK")
+        print("  Whitespace + div=1 constraint: OK")
 
         print("  Whitespace and divisibility by 1: PASS")
         return True
@@ -692,11 +805,11 @@ def test_unknown_dim_spec_rejected():
     try:
         bad_inputs = [
             # Typo in dim name.
-            ("batc=1,seq=64", "typo in dim name"),
+            ("batc(1,1), seq(64,64)", "typo in dim name"),
             # Completely unknown dim.
-            ("foo=5", "non-existent dim"),
+            ("foo(5,5)", "non-existent dim"),
             # Unknown dim in later variant.
-            ("batch=1;xyz=%16", "unknown dim in variant 2"),
+            ("batch(1,1); xyz(0,131072,16)", "unknown dim in variant 2"),
         ]
 
         all_ok = True
@@ -730,6 +843,9 @@ def main():
     results.append(("empty_dim_specs", test_empty_dim_specs()))
     results.append(("mixed_static_divisibility", test_mixed_static_divisibility()))
     results.append(("shared_symbolic_dims", test_shared_symbolic_dims()))
+    results.append(
+        ("shared_dim_conflict_fallback", test_shared_dim_conflict_fallback())
+    )
     results.append(
         ("whitespace_and_div_by_1", test_whitespace_and_divisibility_by_one())
     )

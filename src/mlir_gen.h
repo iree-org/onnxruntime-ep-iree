@@ -38,10 +38,9 @@ using DimSpecVariant = std::vector<DimSpec>;
 // Generates an MLIR module from an OrtGraph and writes it to the specified
 // file. The module contains one function per variant. Each variant is a
 // (function_name_suffix, dim_specs) pair controlling dimension specialization:
-// - kStatic specs replace dynamic dims with concrete values in the function
-//   signature (inputs, outputs, return).
-// - kDivisibleBy specs emit torch.symbolic_int + torch.bind_symbolic_shape ops
-//   at the start of the function body.
+// - Range-only specs (div == 0) emit util.assume.int with umin/umax.
+// - Range+div specs (div > 0) emit util.assume.int with umin/umax/udiv.
+//   Function signatures remain generic (dynamic dims stay as ?).
 // For the unspecialized case, pass a single variant with empty suffix/specs:
 //   {{"", {}}}
 //

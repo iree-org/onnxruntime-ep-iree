@@ -13,10 +13,8 @@
 
 #include "iree_ep.h"
 
-#include <algorithm>
 #include <charconv>
 #include <format>
-#include <numeric>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -36,126 +34,217 @@ namespace onnxruntime::iree {
 // Parsing for dim_specs
 // ============================================================================
 
-// Parses dim_specs in the format "batch=1,seq=%16;batch=2,seq=%16".
-// Semicolons separate variants, commas separate specs within a variant,
-// equals separates key from value. Values are integers (static) or %N
-// (divisibility).
-OrtStatus* ParseDimSpecs(const std::string& spec_str,
-                         std::vector<DimSpecVariant>& out) {
-  out.clear();
+namespace {
 
-  auto err = [](std::string msg) -> OrtStatus* {
-    return Ort::Status(msg.c_str(), ORT_INVALID_ARGUMENT).release();
-  };
+struct DimSpecParseCursor {
+  std::string_view input;
+  size_t pos = 0;
+};
 
-  auto trim = [](std::string_view sv) -> std::string_view {
-    while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.front())))
-      sv.remove_prefix(1);
-    while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.back())))
-      sv.remove_suffix(1);
-    return sv;
-  };
+static OrtStatus* DimSpecError(std::string msg) {
+  return Ort::Status(msg.c_str(), ORT_INVALID_ARGUMENT).release();
+}
 
-  // Pops the next trimmed token before `delim` from `sv`, advancing past it.
-  auto pop_token = [&trim](std::string_view& sv,
-                           char delim) -> std::string_view {
-    auto pos = sv.find(delim);
-    auto token = trim(sv.substr(0, pos));
-    sv = (pos == std::string_view::npos) ? std::string_view{}
-                                         : sv.substr(pos + 1);
-    return token;
-  };
+static std::string_view Trim(std::string_view sv) {
+  while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.front()))) {
+    sv.remove_prefix(1);
+  }
+  while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.back()))) {
+    sv.remove_suffix(1);
+  }
+  return sv;
+}
 
-  // Strict integer parse (no-throw, no allocation). All chars must be consumed.
-  auto parse_int = [](std::string_view sv, int64_t& result) -> bool {
-    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), result);
-    return ec == std::errc{} && ptr == sv.data() + sv.size();
-  };
+static bool IsAtEnd(const DimSpecParseCursor& cursor) {
+  return cursor.pos >= cursor.input.size();
+}
 
-  // Parses a single "key=value" or "key=%N" into a DimSpec.
-  auto parse_spec = [&](std::string_view spec, DimSpec& dim) -> OrtStatus* {
-    auto eq = spec.find('=');
-    if (eq == std::string_view::npos)
-      return err(
-          std::format("dim_specs: missing '=' in \"{}\"", std::string(spec)));
-    auto key = trim(spec.substr(0, eq));
-    auto val = trim(spec.substr(eq + 1));
-    if (key.empty())
-      return err(
-          std::format("dim_specs: empty key in \"{}\"", std::string(spec)));
-    if (val.empty())
-      return err(std::format("dim_specs: empty value for key \"{}\"",
-                             std::string(key)));
+static char Peek(const DimSpecParseCursor& cursor) {
+  return cursor.input[cursor.pos];
+}
 
-    if (val.starts_with('%')) {
-      int64_t divisor = 0;
-      if (val.size() < 2 || !parse_int(val.substr(1), divisor))
-        return err(
-            std::format("dim_specs: invalid divisor in \"{}\" for key \"{}\"",
-                        std::string(val), std::string(key)));
-      if (divisor <= 0)
-        return err(
-            std::format("dim_specs: divisor must be > 0, got {} for key \"{}\"",
-                        divisor, std::string(key)));
-      dim = {std::string(key), DimSpec::Kind::kDivisibleBy, divisor};
+static void SkipWhitespace(DimSpecParseCursor& cursor) {
+  while (!IsAtEnd(cursor) &&
+         std::isspace(static_cast<unsigned char>(Peek(cursor)))) {
+    ++cursor.pos;
+  }
+}
+
+static bool ParseInt(std::string_view sv, int64_t& result) {
+  auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), result);
+  return ec == std::errc{} && ptr == sv.data() + sv.size();
+}
+
+static OrtStatus* ParseIntArg(DimSpecParseCursor& cursor,
+                              const std::string& symbolic_name,
+                              const char* arg_name, int64_t& result) {
+  SkipWhitespace(cursor);
+  size_t start = cursor.pos;
+  while (!IsAtEnd(cursor) && Peek(cursor) != ',' && Peek(cursor) != ')') {
+    ++cursor.pos;
+  }
+  std::string_view token = Trim(cursor.input.substr(start, cursor.pos - start));
+  if (!ParseInt(token, result)) {
+    return DimSpecError(std::format("dim_specs: invalid {} \"{}\" for \"{}\"",
+                                    arg_name, std::string(token),
+                                    symbolic_name));
+  }
+  return nullptr;
+}
+
+static OrtStatus* ParseSpec(DimSpecParseCursor& cursor, DimSpec& dim) {
+  SkipWhitespace(cursor);
+  size_t spec_start = cursor.pos;
+
+  // Parse name (everything up to '(' with surrounding whitespace ignored).
+  while (!IsAtEnd(cursor) && Peek(cursor) != '(' && Peek(cursor) != ',' &&
+         Peek(cursor) != ';') {
+    ++cursor.pos;
+  }
+  if (IsAtEnd(cursor) || Peek(cursor) != '(') {
+    std::string_view bad =
+        Trim(cursor.input.substr(spec_start, cursor.pos - spec_start));
+    return DimSpecError(
+        std::format("dim_specs: missing '(' in \"{}\"", std::string(bad)));
+  }
+
+  std::string_view name =
+      Trim(cursor.input.substr(spec_start, cursor.pos - spec_start));
+  if (name.empty()) {
+    return DimSpecError(
+        std::format("dim_specs: empty name in \"{}\"",
+                    std::string(cursor.input.substr(
+                        spec_start, cursor.pos - spec_start + 1))));
+  }
+
+  std::string symbolic_name(name);
+  ++cursor.pos;  // Consume '('.
+
+  int64_t min_val = 0;
+  ORT_RETURN_IF_ERROR(ParseIntArg(cursor, symbolic_name, "min", min_val));
+  if (IsAtEnd(cursor) || Peek(cursor) != ',') {
+    return DimSpecError(std::format(
+        "dim_specs: expected ',' after min for \"{}\"", symbolic_name));
+  }
+  ++cursor.pos;  // Consume ','.
+
+  int64_t max_val = 0;
+  ORT_RETURN_IF_ERROR(ParseIntArg(cursor, symbolic_name, "max", max_val));
+
+  int64_t div_val = 0;
+  bool has_div_arg = false;
+  if (!IsAtEnd(cursor) && Peek(cursor) == ',') {
+    ++cursor.pos;  // Consume ',' before div.
+    has_div_arg = true;
+    ORT_RETURN_IF_ERROR(ParseIntArg(cursor, symbolic_name, "div", div_val));
+  }
+
+  if (IsAtEnd(cursor) || Peek(cursor) != ')') {
+    return DimSpecError(
+        std::format("dim_specs: missing ')' for \"{}\"", symbolic_name));
+  }
+  ++cursor.pos;  // Consume ')'.
+
+  // Only whitespace is allowed after ')' before ',' / ';' / end.
+  SkipWhitespace(cursor);
+  if (!IsAtEnd(cursor) && Peek(cursor) != ',' && Peek(cursor) != ';') {
+    return DimSpecError(
+        std::format("dim_specs: unexpected characters after ')' for \"{}\"",
+                    symbolic_name));
+  }
+
+  if (min_val < 0) {
+    return DimSpecError(
+        std::format("dim_specs: min must be >= 0, got {} for \"{}\"", min_val,
+                    symbolic_name));
+  }
+  if (max_val < min_val) {
+    return DimSpecError(std::format(
+        "dim_specs: max must be >= min, got min={} max={} for \"{}\"", min_val,
+        max_val, symbolic_name));
+  }
+  if (has_div_arg && div_val <= 0) {
+    return DimSpecError(
+        std::format("dim_specs: div must be > 0, got {} for \"{}\"", div_val,
+                    symbolic_name));
+  }
+
+  dim = {symbolic_name, min_val, max_val, div_val};
+  return nullptr;
+}
+
+static OrtStatus* ParseVariant(DimSpecParseCursor& cursor,
+                               DimSpecVariant& variant) {
+  std::unordered_set<std::string> seen_symbolic_names;
+
+  while (true) {
+    SkipWhitespace(cursor);
+    if (IsAtEnd(cursor) || Peek(cursor) == ';') {
       return nullptr;
     }
-
-    int64_t value = 0;
-    if (!parse_int(val, value))
-      return err(std::format("dim_specs: invalid number \"{}\" for key \"{}\"",
-                             std::string(val), std::string(key)));
-    if (value <= 0)
-      return err(std::format(
-          "dim_specs: static dim must be > 0, got {} for key \"{}\"", value,
-          std::string(key)));
-    dim = {std::string(key), DimSpec::Kind::kStatic, value};
-    return nullptr;
-  };
-
-  // Parses a comma-separated list of specs into a variant.
-  auto parse_variant = [&](std::string_view str,
-                           DimSpecVariant& variant) -> OrtStatus* {
-    while (!str.empty()) {
-      auto spec = pop_token(str, ',');
-      if (spec.empty()) continue;
-      DimSpec dim;
-      ORT_RETURN_IF_ERROR(parse_spec(spec, dim));
-      variant.push_back(std::move(dim));
+    if (Peek(cursor) == ',') {
+      // Preserve prior behavior: ignore empty entries like ",,".
+      ++cursor.pos;
+      continue;
     }
-    return nullptr;
-  };
 
-  std::string_view input = trim(spec_str);
-  if (input.empty()) return nullptr;
+    DimSpec dim;
+    ORT_RETURN_IF_ERROR(ParseSpec(cursor, dim));
+    if (!seen_symbolic_names.insert(dim.symbolic_name).second) {
+      return DimSpecError(std::format(
+          "dim_specs: duplicate key \"{}\" in one variant", dim.symbolic_name));
+    }
+    variant.push_back(std::move(dim));
 
-  while (!input.empty()) {
-    auto variant_str = pop_token(input, ';');
-    if (variant_str.empty()) continue;
+    SkipWhitespace(cursor);
+    if (IsAtEnd(cursor) || Peek(cursor) == ';') {
+      return nullptr;
+    }
+    if (Peek(cursor) != ',') {
+      return DimSpecError("dim_specs: expected ',' between specs");
+    }
+    ++cursor.pos;  // Consume comma between specs.
+  }
+}
+
+static OrtStatus* ParseDimSpecsImpl(std::string_view spec_str,
+                                    std::vector<DimSpecVariant>& out) {
+  out.clear();
+  DimSpecParseCursor cursor{Trim(spec_str), 0};
+
+  while (!IsAtEnd(cursor)) {
     DimSpecVariant variant;
-    ORT_RETURN_IF_ERROR(parse_variant(variant_str, variant));
+    ORT_RETURN_IF_ERROR(ParseVariant(cursor, variant));
     if (!variant.empty()) out.push_back(std::move(variant));
+
+    SkipWhitespace(cursor);
+    if (IsAtEnd(cursor)) break;
+    if (Peek(cursor) != ';') {
+      return DimSpecError("dim_specs: expected ';' between variants");
+    }
+    ++cursor.pos;  // Consume ';'.
   }
 
   return nullptr;
 }
 
-// Returns a specificity score for a variant. Higher = more specific.
-// Static specs count as 2, divisibility specs count as 1.
-static int VariantSpecificity(const DimSpecVariant& variant) {
-  int score = 0;
-  for (const auto& spec : variant) {
-    score += (spec.kind == DimSpec::Kind::kStatic) ? 2 : 1;
-  }
-  return score;
+}  // namespace
+
+// Parses dim_specs in the format "batch(1,1), seq(0,131072,16)".
+// Semicolons separate variants. Commas outside parentheses separate specs.
+// Each spec is name(min, max) or name(min, max, div).
+OrtStatus* ParseDimSpecs(const std::string& spec_str,
+                         std::vector<DimSpecVariant>& out) {
+  return ParseDimSpecsImpl(spec_str, out);
 }
 
-// Builds symbolic dimension mappings from graph inputs. This tells the runtime
-// which (input_index, dim_index) corresponds to each symbolic dimension name.
+// Builds symbolic dimension mappings from graph inputs. Returns ALL occurrences
+// of each symbolic dimension (not deduplicated). This allows ComputeImpl to
+// verify that all inputs sharing a symbolic dim agree on the actual value
+// before dispatching to a specialized variant.
 static std::vector<IreeNodeComputeInfo::SymbolicDimMapping>
 BuildSymbolicDimMappings(const Ort::ConstGraph& graph) {
   std::vector<IreeNodeComputeInfo::SymbolicDimMapping> mappings;
-  std::unordered_set<std::string> seen;
 
   auto inputs = graph.GetInputs();
   auto initializers = graph.GetInitializers();
@@ -176,15 +265,69 @@ BuildSymbolicDimMappings(const Ort::ConstGraph& graph) {
         if (shape[d] >= 0 || d >= sym_dims.size() || sym_dims[d] == nullptr ||
             sym_dims[d][0] == '\0')
           continue;
-        std::string name(sym_dims[d]);
-        if (seen.count(name)) continue;
-        seen.insert(name);
-        mappings.push_back({input_index, d, name});
+        mappings.push_back({input_index, d, std::string(sym_dims[d])});
       }
     }
     input_index++;
   }
   return mappings;
+}
+
+struct DispatchDimState {
+  std::unordered_map<std::string, int64_t> dim_values;
+  bool has_conflict = false;
+};
+
+static DispatchDimState CollectDimValuesAndConflicts(
+    const Ort::KernelContext& ctx,
+    const std::vector<IreeNodeComputeInfo::SymbolicDimMapping>& dim_mappings) {
+  DispatchDimState state;
+  for (const auto& mapping : dim_mappings) {
+    if (mapping.input_index >= ctx.GetInputCount()) continue;
+    auto shape = ctx.GetInput(mapping.input_index)
+                     .GetTensorTypeAndShapeInfo()
+                     .GetShape();
+    if (mapping.dim_index >= shape.size()) continue;
+    int64_t actual_value = shape[mapping.dim_index];
+    auto [it, inserted] =
+        state.dim_values.try_emplace(mapping.symbolic_name, actual_value);
+    if (!inserted && it->second != actual_value) {
+      state.has_conflict = true;
+    }
+  }
+  return state;
+}
+
+static bool VariantMatchesDimSpecs(
+    const IreeNodeComputeInfo::Variant& variant,
+    const std::unordered_map<std::string, int64_t>& dim_values,
+    bool has_conflict) {
+  // If inputs disagree on a shared symbolic dim, skip specialized variants
+  // (they apply tie_shape which assumes all occurrences are equal).
+  if (has_conflict && !variant.dim_specs.empty()) return false;
+
+  for (const auto& spec : variant.dim_specs) {
+    auto it = dim_values.find(spec.symbolic_name);
+    if (it == dim_values.end()) continue;
+
+    int64_t actual = it->second;
+    if (actual < spec.min || actual > spec.max) return false;
+    if (spec.div > 0 && (actual <= 0 || actual % spec.div != 0)) return false;
+  }
+  return true;
+}
+
+static const IreeNodeComputeInfo::Variant* SelectMatchingVariant(
+    const std::vector<IreeNodeComputeInfo::Variant>& variants,
+    const std::unordered_map<std::string, int64_t>& dim_values,
+    bool has_conflict) {
+  // Variants are in user-specified order (first match wins).
+  for (const auto& variant : variants) {
+    if (VariantMatchesDimSpecs(variant, dim_values, has_conflict)) {
+      return &variant;
+    }
+  }
+  return nullptr;
 }
 
 static std::vector<std::string> GenerateCompileFlags(
@@ -315,14 +458,8 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
   const auto& dim_spec_variants = ep->config_.dim_spec_variants;
   size_t num_specialized = dim_spec_variants.size();
 
-  // Sort specialized variants by specificity (most specific first).
-  std::vector<size_t> sorted_indices(num_specialized);
-  std::iota(sorted_indices.begin(), sorted_indices.end(), 0);
-  std::sort(sorted_indices.begin(), sorted_indices.end(),
-            [&](size_t a, size_t b) {
-              return VariantSpecificity(dim_spec_variants[a]) >
-                     VariantSpecificity(dim_spec_variants[b]);
-            });
+  // Variants are dispatched in user-specified order (first match wins).
+  // Preserving caller order makes precedence explicit for overlaps.
 
   // Create temp files: one combined MLIR, one VMFB, one IRPA.
   TempFile mlir_file(".mlir");
@@ -350,9 +487,8 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
 
   std::vector<std::pair<std::string, DimSpecVariant>> mlir_variants;
   for (size_t i = 0; i < num_specialized; ++i) {
-    size_t variant_idx = sorted_indices[i];
     mlir_variants.emplace_back("_variant" + std::to_string(i),
-                               dim_spec_variants[variant_idx]);
+                               dim_spec_variants[i]);
   }
 
   // Add a generic fallback variant.
@@ -504,39 +640,10 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
   auto* info = static_cast<IreeNodeComputeInfo*>(this_ptr);
   Ort::KernelContext ctx(kernel_context);
 
-  // --- Runtime variant dispatch ---
-  // Build actual dim values from input shapes using the symbolic dim mappings.
-  std::unordered_map<std::string, int64_t> dim_values;
-  for (const auto& m : info->dim_mappings_) {
-    if (m.input_index >= ctx.GetInputCount()) continue;
-    auto shape =
-        ctx.GetInput(m.input_index).GetTensorTypeAndShapeInfo().GetShape();
-    if (m.dim_index >= shape.size()) continue;
-    dim_values[m.symbolic_name] = shape[m.dim_index];
-  }
-
-  // Select best matching variant (iterate most specific to least).
-  // The generic fallback is always last and always matches.
-  const Variant* selected = nullptr;
-  for (const auto& v : info->variants_) {
-    bool match = true;
-    for (const auto& spec : v.dim_specs) {
-      auto it = dim_values.find(spec.symbolic_name);
-      if (it == dim_values.end()) continue;
-      if (spec.kind == DimSpec::Kind::kStatic && it->second != spec.value) {
-        match = false;
-        break;
-      }
-      if (spec.kind == DimSpec::Kind::kDivisibleBy &&
-          (it->second <= 0 || it->second % spec.value != 0)) {
-        match = false;
-        break;
-      }
-    }
-    if (!match) continue;
-    selected = &v;
-    break;
-  }
+  DispatchDimState dispatch_state =
+      CollectDimValuesAndConflicts(ctx, info->dim_mappings_);
+  const Variant* selected = SelectMatchingVariant(
+      info->variants_, dispatch_state.dim_values, dispatch_state.has_conflict);
   assert(selected && "At least the generic fallback variant should match");
 
   iree_hal_device_t* device = info->ep.IreeDevice();
