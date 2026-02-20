@@ -354,6 +354,8 @@ OrtStatus* ORT_API_CALL IreeEpFactory::CreateEpImpl(
         sess_opts.GetConfigEntryOrDefault("ep.iree.opt_level", "O0");
     config.save_intermediates = sess_opts.GetConfigEntryOrDefault(
                                     "ep.iree.save_intermediates", "0") == "1";
+    config.enable_ep_context_cache = sess_opts.GetConfigEntryOrDefault(
+                                    "ep.iree.enable_ep_context_cache", "0") == "1";
   }
 
   // Select backend based on driver.

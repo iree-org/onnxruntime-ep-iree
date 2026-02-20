@@ -13,6 +13,7 @@
 
 #include "iree_ep.h"
 
+#include <fstream>
 #include <vector>
 
 #include "iree/modules/io/parameters/module.h"
@@ -89,6 +90,10 @@ iree_hal_device_t* IreeEp::IreeDevice() const {
   return factory_.GetDeviceForId(device_id_);
 }
 
+iree_runtime_instance_t* IreeEp::IreeInstance() const {
+  return factory_.IreeInstance();
+}
+
 /*static*/
 const char* ORT_API_CALL IreeEp::GetNameImpl(const OrtEp* this_ptr) noexcept {
   const auto* ep = static_cast<const IreeEp*>(this_ptr);
@@ -151,7 +156,7 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
   TempFile vmfb_file(".vmfb");
   TempFile irpa_file(".irpa");
 
-  // If save_intermediates is enabled, mark files to be kept for debugging.
+  // save_intermediates: keep all artifacts on disk for debugging/inspection.
   if (ep->config_.save_intermediates) {
     mlir_file.Keep();
     vmfb_file.Keep();
@@ -159,6 +164,20 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
     ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                           "IREE EP: Saving MLIR to: %s",
                           mlir_file.Path().c_str());
+    ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+                          "IREE EP: Saving VMFB to: %s",
+                          vmfb_file.Path().c_str());
+    ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+                          "IREE EP: Saving IRPA to: %s",
+                          irpa_file.Path().c_str());
+  }
+
+  // enable_ep_context_cache: keep only compiled artifacts (VMFB, IRPA) needed for
+  // caching. MLIR is a transient intermediate — only the final compiled
+  // artifacts are needed to skip recompilation on subsequent runs.
+  if (!ep->config_.save_intermediates && ep->config_.enable_ep_context_cache) {
+    vmfb_file.Keep();
+    irpa_file.Keep();
     ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                           "IREE EP: Saving VMFB to: %s",
                           vmfb_file.Path().c_str());
@@ -190,55 +209,39 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: VMFB Generated Successfully");
 
-  // Phase 3: Create IREE runtime session.
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: Creating runtime session");
-  RuntimeSessionPtr session;
-  iree_runtime_session_options_t session_opts;
-  iree_runtime_session_options_initialize(&session_opts);
-  IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_create_with_device(
-      ep->factory_.IreeInstance(), &session_opts, ep->IreeDevice(),
-      iree_runtime_instance_host_allocator(ep->factory_.IreeInstance()),
-      session.ForOutput()));
-
-  // Phase 4: Register io_parameters module if we have parameters.
-  // The session retains the module, which retains the provider, which retains
-  // the index. No need to store these separately.
-  if (parameter_provider) {
-    ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                         "IREE EP: Registering parameter provider");
-    VmModulePtr parameters_module;
-    iree_io_parameter_provider_t* provider_raw = parameter_provider.Get();
-    IREE_ORT_RETURN_IF_ERROR(iree_io_parameters_module_create(
-        iree_runtime_instance_vm_instance(ep->factory_.IreeInstance()), 1,
-        &provider_raw,
-        iree_runtime_instance_host_allocator(ep->factory_.IreeInstance()),
-        parameters_module.ForOutput()));
-    IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_append_module(
-        session.Get(), parameters_module.Get()));
+  // Read VMFB into memory. Session creation is deferred to first execution,
+  // which allows the VMFB to be cached and loaded on a different device.
+  std::ifstream vmfb_stream(vmfb_file.Path(),
+                            std::ios::binary | std::ios::ate);
+  if (!vmfb_stream) {
+    return Ort::Status("IREE EP: Failed to open VMFB file", ORT_FAIL)
+        .release();
+  }
+  std::streampos vmfb_pos = vmfb_stream.tellg();
+  if (vmfb_pos == std::streampos(-1) || vmfb_pos <= 0) {
+    return Ort::Status("IREE EP: Failed to determine VMFB file size", ORT_FAIL)
+        .release();
+  }
+  auto vmfb_size = static_cast<size_t>(vmfb_pos);
+  vmfb_stream.seekg(0, std::ios::beg);
+  std::vector<uint8_t> vmfb_data(vmfb_size);
+  if (!vmfb_stream.read(reinterpret_cast<char*>(vmfb_data.data()),
+                        static_cast<std::streamsize>(vmfb_size))) {
+    return Ort::Status("IREE EP: Failed to read VMFB file contents", ORT_FAIL)
+        .release();
   }
 
-  // Phase 5: Load VMFB bytecode module.
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: Loading VMFB module");
-  IREE_ORT_RETURN_IF_ERROR(
-      iree_runtime_session_append_bytecode_module_from_file(
-          session.Get(), vmfb_file.Path().c_str()));
-
-  // Phase 6: Lookup the main function.
-  // Function name format: "module.{graph_name}" (defaults to "main" if empty).
+  // Build function name for later lookup.
+  // Format: "module.{graph_name}" (defaults to "main" if empty).
   std::string graph_name = graph.GetName();
   std::string function_name =
       "module." + (graph_name.empty() ? std::string("main") : graph_name);
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: Looking up function");
 
-  iree_vm_function_t function;
-  IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_lookup_function(
-      session.Get(), iree_make_cstring_view(function_name.c_str()), &function));
-
-  // Create NodeComputeInfo with session and function (transfers ownership).
-  auto* info = new IreeNodeComputeInfo(*ep, std::move(session), function);
+  // Create NodeComputeInfo with compiled artifacts. Session creation and VMFB
+  // loading are deferred to first ComputeImpl call (lazy initialization).
+  auto* info = new IreeNodeComputeInfo(
+      *ep, std::move(vmfb_data), std::move(parameter_index),
+      std::move(parameter_provider), std::move(function_name));
   node_compute_infos[0] = info;
 
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
@@ -262,10 +265,15 @@ void ORT_API_CALL IreeEp::ReleaseNodeComputeInfosImpl(
 // IreeNodeComputeInfo Implementation
 // ============================================================================
 
-IreeNodeComputeInfo::IreeNodeComputeInfo(IreeEp& ep_ref,
-                                         RuntimeSessionPtr session,
-                                         iree_vm_function_t function)
-    : ep(ep_ref), session_(std::move(session)), function_(function) {
+IreeNodeComputeInfo::IreeNodeComputeInfo(
+    IreeEp& ep_ref, std::vector<uint8_t> vmfb_data,
+    ParameterIndexPtr parameter_index, ParameterProviderPtr parameter_provider,
+    std::string function_name)
+    : ep(ep_ref),
+      vmfb_data_(std::move(vmfb_data)),
+      parameter_index_(std::move(parameter_index)),
+      parameter_provider_(std::move(parameter_provider)),
+      function_name_(std::move(function_name)) {
   ort_version_supported = ORT_API_VERSION;
   CreateState = CreateStateImpl;
   Compute = ComputeImpl;
@@ -275,8 +283,49 @@ IreeNodeComputeInfo::IreeNodeComputeInfo(IreeEp& ep_ref,
 IreeNodeComputeInfo::~IreeNodeComputeInfo() {
   // Note: Avoid using logger during cleanup - ORT logging infrastructure may
   // be torn down before our destructors run during Python interpreter shutdown.
-  // Explicitly release session to ensure proper cleanup ordering.
+  // Release session before vmfb_data_ is destroyed, since the session
+  // references VMFB bytes directly (loaded with iree_allocator_null).
+  // Redundant with current member declaration order but defensive against
+  // future reordering.
   session_.Reset();
+}
+
+OrtStatus* IreeNodeComputeInfo::InitializeSession() {
+  // Phase 1: Create IREE runtime session with device.
+  iree_runtime_session_options_t session_opts;
+  iree_runtime_session_options_initialize(&session_opts);
+  IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_create_with_device(
+      ep.IreeInstance(), &session_opts, ep.IreeDevice(),
+      iree_runtime_instance_host_allocator(ep.IreeInstance()),
+      session_.ForOutput()));
+
+  // Phase 2: Register io_parameters module if we have parameters.
+  if (parameter_provider_) {
+    VmModulePtr parameters_module;
+    iree_io_parameter_provider_t* provider_raw = parameter_provider_.Get();
+    IREE_ORT_RETURN_IF_ERROR(iree_io_parameters_module_create(
+        iree_runtime_instance_vm_instance(ep.IreeInstance()), 1,
+        &provider_raw,
+        iree_runtime_instance_host_allocator(ep.IreeInstance()),
+        parameters_module.ForOutput()));
+    IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_append_module(
+        session_.Get(), parameters_module.Get()));
+  }
+
+  // Phase 3: Load VMFB from memory (avoids disk round-trip).
+  iree_const_byte_span_t flatbuffer_data = {
+      vmfb_data_.data(),
+      static_cast<iree_host_size_t>(vmfb_data_.size())};
+  IREE_ORT_RETURN_IF_ERROR(
+      iree_runtime_session_append_bytecode_module_from_memory(
+          session_.Get(), flatbuffer_data, iree_allocator_null()));
+
+  // Phase 4: Lookup function.
+  IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_lookup_function(
+      session_.Get(), iree_make_cstring_view(function_name_.c_str()),
+      &function_));
+
+  return nullptr;
 }
 
 /*static*/
@@ -294,6 +343,18 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
     OrtNodeComputeInfo* this_ptr, void* /*compute_state*/,
     OrtKernelContext* kernel_context) noexcept {
   auto* info = static_cast<IreeNodeComputeInfo*>(this_ptr);
+
+  // Lazy-init: create session on first invocation (thread-safe).
+  std::call_once(info->init_flag_, [info]() {
+    OrtStatus* status = info->InitializeSession();
+    if (status) {
+      info->init_error_ = Ort::Status(status).GetErrorMessage();
+    }
+  });
+  if (!info->init_error_.empty()) {
+    return Ort::Status(info->init_error_.c_str(), ORT_FAIL).release();
+  }
+
   Ort::KernelContext ctx(kernel_context);
 
   iree_hal_device_t* device = info->ep.IreeDevice();

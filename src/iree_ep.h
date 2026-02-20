@@ -14,7 +14,9 @@
 #ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_EP_H_
 #define ONNXRUNTIME_EP_IREE_SRC_IREE_EP_H_
 
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "iree_ep_factory.h"
 #include "iree_wrappers.h"
@@ -31,7 +33,7 @@ class IreeEpFactory;
 class IreeEp : public OrtEp, public ApiPtrs {
  public:
   struct Config {
-    bool enable_ep_context = false;
+    bool enable_ep_context_cache = false;
     // Target architecture to compile for.
     // TODO: Ideally, we want to get this from the device. I'm not sure how
     // to do this in IREE.
@@ -54,6 +56,10 @@ class IreeEp : public OrtEp, public ApiPtrs {
 
   // Accessor for the logger.
   [[nodiscard]] const Ort::Logger& Logger() const { return logger_; }
+
+  // Accessor for the IREE runtime instance (needed by IreeNodeComputeInfo for
+  // lazy session creation).
+  [[nodiscard]] iree_runtime_instance_t* IreeInstance() const;
 
  private:
   // EP interface implementations (called via function pointers).
@@ -90,12 +96,24 @@ class IreeEp : public OrtEp, public ApiPtrs {
 };
 
 // Compute kernel for compiled nodes.
-// Holds the IREE session and function for a compiled subgraph.
+//
+// Stores compiled VMFB bytes and defers session creation to first execution.
+// This separates compilation (device-independent) from execution (device-bound),
+// enabling cross-machine caching: compile on machine A, execute on machine B.
+//
+// NOTE: Because session creation is lazy, errors such as VMFB loading failures
+// or function lookup mismatches surface on the first Run() call rather than
+// during InferenceSession construction. This is a deliberate trade-off:
+// compilation (CompileImpl) validates MLIR generation and iree-compile success,
+// while runtime errors (device mismatch, bytecode version skew) are reported
+// at execution time when the target device is actually bound.
 struct IreeNodeComputeInfo : OrtNodeComputeInfo {
-  // Constructor takes ownership of session and stores function reference.
-  // Session is created in CompileImpl and passed here.
-  IreeNodeComputeInfo(IreeEp& ep, RuntimeSessionPtr session,
-                      iree_vm_function_t function);
+  // Constructor takes compiled artifacts. Session is created lazily on first
+  // ComputeImpl call.
+  IreeNodeComputeInfo(IreeEp& ep, std::vector<uint8_t> vmfb_data,
+                      ParameterIndexPtr parameter_index,
+                      ParameterProviderPtr parameter_provider,
+                      std::string function_name);
 
   ~IreeNodeComputeInfo();
 
@@ -116,9 +134,23 @@ struct IreeNodeComputeInfo : OrtNodeComputeInfo {
   // Non-owning reference to parent EP. The EP must outlive this compute info.
   IreeEp& ep;
 
-  // IREE runtime state for this compiled subgraph.
+  // Compilation artifacts (produced in CompileImpl, device-independent).
+  // vmfb_data_ must outlive session_ since IREE references it directly.
+  std::vector<uint8_t> vmfb_data_;
+  ParameterIndexPtr parameter_index_;
+  ParameterProviderPtr parameter_provider_;
+  std::string function_name_;
+
+  // Runtime state (lazily initialized on first ComputeImpl call).
   RuntimeSessionPtr session_;
-  iree_vm_function_t function_;
+  iree_vm_function_t function_{};
+  std::once_flag init_flag_;
+  std::string init_error_;
+
+ private:
+  // Creates the IREE session, loads VMFB from memory, looks up function.
+  // Called once via std::call_once from ComputeImpl.
+  OrtStatus* InitializeSession();
 };
 
 }  // namespace onnxruntime::iree
