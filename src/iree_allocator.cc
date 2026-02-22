@@ -12,6 +12,8 @@
 
 #include "iree_allocator.h"
 
+#include <mutex>
+
 #include "iree/hal/allocator.h"
 #include "iree/hal/buffer.h"
 
@@ -48,8 +50,7 @@ IreeAllocator::~IreeAllocator() {
 void* ORT_API_CALL IreeAllocator::AllocImpl(OrtAllocator* this_, size_t size) {
   auto* self = static_cast<IreeAllocator*>(this_);
 
-  // TODO(thread-safety): std::lock_guard<std::mutex>
-  // lock(self->allocations_mutex_);
+  std::lock_guard<std::mutex> lock(self->allocations_mutex_);
 
   if (size == 0) {
     return nullptr;
@@ -107,8 +108,7 @@ void* ORT_API_CALL IreeAllocator::AllocImpl(OrtAllocator* this_, size_t size) {
 void ORT_API_CALL IreeAllocator::FreeImpl(OrtAllocator* this_, void* p) {
   auto* self = static_cast<IreeAllocator*>(this_);
 
-  // TODO(thread-safety): std::lock_guard<std::mutex>
-  // lock(self->allocations_mutex_);
+  std::lock_guard<std::mutex> lock(self->allocations_mutex_);
 
   if (p == nullptr) {
     return;
