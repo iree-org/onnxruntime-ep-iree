@@ -40,24 +40,23 @@ bool ORT_API_CALL IreeDataTransfer::CanCopyImpl(
     const OrtMemoryDevice* dst_memory_device) noexcept {
   const auto* self = static_cast<const IreeDataTransfer*>(this_ptr);
 
-  // Get vendor IDs from both memory devices.
   uint32_t src_vendor_id =
       self->factory_.ep_api.MemoryDevice_GetVendorId(src_memory_device);
   uint32_t dst_vendor_id =
       self->factory_.ep_api.MemoryDevice_GetVendorId(dst_memory_device);
+  OrtMemoryInfoDeviceType src_type =
+      self->factory_.ep_api.MemoryDevice_GetDeviceType(src_memory_device);
+  OrtMemoryInfoDeviceType dst_type =
+      self->factory_.ep_api.MemoryDevice_GetDeviceType(dst_memory_device);
 
-  // We can copy if either source or destination is our IREE device,
-  // and the other is either our IREE device or CPU (vendor_id == 0).
-  // TODO: Is the vendor id check for CPU actually correct? Maybe we can check
-  // the hardware device for and determine if it's HOST/CPU.
   bool src_is_iree = (src_vendor_id == kEpVendorId);
   bool dst_is_iree = (dst_vendor_id == kEpVendorId);
-  bool src_is_cpu = (src_vendor_id == 0);
-  bool dst_is_cpu = (dst_vendor_id == 0);
+  bool src_is_cpu = (src_type == OrtMemoryInfoDeviceType_CPU);
+  bool dst_is_cpu = (dst_type == OrtMemoryInfoDeviceType_CPU);
 
   // Supported transfers:
   // - IREE <-> CPU (H2D, D2H)
-  // - IREE <-> IREE (D2D on same device)
+  // - IREE <-> IREE (D2D)
   return (src_is_iree && (dst_is_iree || dst_is_cpu)) ||
          (dst_is_iree && (src_is_iree || src_is_cpu));
 }

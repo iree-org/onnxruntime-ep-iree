@@ -12,7 +12,6 @@
 
 #include "iree_ep_factory.h"
 
-#include <algorithm>
 #include <memory>
 #include <mutex>
 
@@ -23,6 +22,9 @@
 namespace onnxruntime::iree {
 
 namespace {
+
+constexpr const char* kEpVendor = "IREE";
+constexpr const char* kEpVersion = "0.1.0";
 
 // Stub kernel — never instantiated or executed. Exists only to satisfy the
 // CustomOpBase<TOp, TKernel> template requirements.
@@ -109,89 +111,6 @@ IreeEpFactory::IreeEpFactory(const char* ep_name, ApiPtrs apis,
                          "IREE EP: Failed to create IREE runtime instance");
     iree_status_ignore(status);
     return;
-  }
-
-  CreateIreeHwDevices();
-}
-
-void IreeEpFactory::CreateIreeHwDevices() {
-  iree_allocator_t allocator = iree_allocator_system();
-  iree_hal_driver_registry_t* registry =
-      iree_runtime_instance_driver_registry(instance_.Get());
-
-  iree_host_size_t driver_count = 0;
-  IreeAllocatedPtr<iree_hal_driver_info_t> driver_infos(allocator);
-  iree_status_t status = iree_hal_driver_registry_enumerate(
-      registry, allocator, &driver_count, driver_infos.ForOutput());
-  if (!iree_status_is_ok(status)) {
-    ORT_CXX_LOG_NOEXCEPT(logger_, ORT_LOGGING_LEVEL_WARNING,
-                         "IREE EP: Failed to enumerate drivers");
-    iree_status_ignore(status);
-    return;
-  }
-
-  size_t device_index = 0;
-  for (iree_host_size_t i = 0; i < driver_count; ++i) {
-    iree_string_view_t driver_name = driver_infos.Get()[i].driver_name;
-    std::string driver_name_str(driver_name.data, driver_name.size);
-
-    HalDriverPtr driver;
-    status = iree_hal_driver_registry_try_create(registry, driver_name,
-                                                 allocator, driver.ForOutput());
-    if (!iree_status_is_ok(status)) {
-      iree_status_ignore(status);
-      continue;
-    }
-
-    iree_host_size_t device_count = 0;
-    IreeAllocatedPtr<iree_hal_device_info_t> device_infos(allocator);
-    status = iree_hal_driver_query_available_devices(
-        driver.Get(), allocator, &device_count, device_infos.ForOutput());
-    if (!iree_status_is_ok(status)) {
-      iree_status_ignore(status);
-      continue;
-    }
-
-    // Create OrtHardwareDevice for each IREE device available.
-    //
-    // Given an OrtHardwareDevice, ORT can find which hardware device it is by
-    // checking its vendor id (should be kEpVendorId) and the device id (the
-    // index it's stored in hw_devices_).
-    //
-    // IREE can identify the device using the driver and device path stored in
-    // the hardware device metadata.
-    for (iree_host_size_t j = 0; j < device_count; ++j) {
-      iree_string_view_t device_path = device_infos.Get()[j].path;
-      std::string device_path_str(device_path.data, device_path.size);
-
-      OrtKeyValuePairs* hw_metadata = nullptr;
-      ort_api.CreateKeyValuePairs(&hw_metadata);
-      ort_api.AddKeyValuePair(hw_metadata, "iree.driver",
-                              driver_name_str.c_str());
-      ort_api.AddKeyValuePair(hw_metadata, "iree.device_path",
-                              device_path_str.c_str());
-      // Store device_id for later retrieval in CreateEpImpl.
-      ort_api.AddKeyValuePair(hw_metadata, "iree.device_id",
-                              std::to_string(device_index).c_str());
-
-      // TODO: We are pretending here that all IREE devices are GPUs. This is
-      // because we follow a host <-> device model in IREE. How does this
-      // matter in practice? If we are using IREE APIs anyway, does it matter
-      // if we set this to CPU?
-      OrtHardwareDeviceType device_type = OrtHardwareDeviceType_GPU;
-
-      OrtHardwareDevice* hw_device = nullptr;
-      OrtStatus* ort_status = ep_api.CreateHardwareDevice(
-          device_type, kEpVendorId, static_cast<uint32_t>(device_index++),
-          kEpVendor, hw_metadata, &hw_device);
-      ort_api.ReleaseKeyValuePairs(hw_metadata);
-      if (ort_status != nullptr) {
-        ort_api.ReleaseStatus(ort_status);
-        continue;
-      }
-
-      hw_devices_.push_back(hw_device);
-    }
   }
 }
 
@@ -309,14 +228,98 @@ OrtStatus* ORT_API_CALL IreeEpFactory::GetSupportedDevicesImpl(
   size_t& num_ep_devices = *p_num_ep_devices;
   num_ep_devices = 0;
 
-  // Reserve capacity for memory_info objects to prevent reallocation during
-  // the loop. This is critical because EpDevice_AddAllocatorInfo stores
-  // pointers and reallocation would invalidate them.
-  size_t num_devices_to_add =
-      std::min(factory->hw_devices_.size(), max_ep_devices);
-  factory->device_memory_infos_.reserve(num_devices_to_add);
+  // Lazily enumerate IREE devices on first call.
+  if (factory->hw_devices_.empty()) {
+    iree_allocator_t allocator = iree_allocator_system();
+    iree_hal_driver_registry_t* registry =
+        iree_runtime_instance_driver_registry(factory->instance_.Get());
 
-  // Create OrtEpDevice for each hardware device enumerated in constructor.
+    iree_host_size_t driver_count = 0;
+    IreeAllocatedPtr<iree_hal_driver_info_t> driver_infos(allocator);
+    iree_status_t status = iree_hal_driver_registry_enumerate(
+        registry, allocator, &driver_count, driver_infos.ForOutput());
+    if (!iree_status_is_ok(status)) {
+      ORT_CXX_LOG_NOEXCEPT(factory->logger_, ORT_LOGGING_LEVEL_WARNING,
+                           "IREE EP: Failed to enumerate drivers");
+      iree_status_ignore(status);
+      return nullptr;
+    }
+
+    size_t device_index = 0;
+    for (iree_host_size_t i = 0; i < driver_count; ++i) {
+      iree_string_view_t driver_name = driver_infos.Get()[i].driver_name;
+      std::string driver_name_str(driver_name.data, driver_name.size);
+
+      HalDriverPtr driver;
+      status = iree_hal_driver_registry_try_create(
+          registry, driver_name, allocator, driver.ForOutput());
+      if (!iree_status_is_ok(status)) {
+        iree_status_ignore(status);
+        continue;
+      }
+
+      iree_host_size_t device_count = 0;
+      IreeAllocatedPtr<iree_hal_device_info_t> device_infos(allocator);
+      status = iree_hal_driver_query_available_devices(
+          driver.Get(), allocator, &device_count, device_infos.ForOutput());
+      if (!iree_status_is_ok(status)) {
+        iree_status_ignore(status);
+        continue;
+      }
+
+      // Create OrtHardwareDevice and MemoryInfo for each IREE device.
+      //
+      // Given an OrtHardwareDevice, ORT identifies it by vendor_id
+      // (kEpVendorId) and device_id (index in hw_devices_). IREE identifies
+      // the device using the driver and device path in metadata.
+      for (iree_host_size_t j = 0; j < device_count; ++j) {
+        iree_string_view_t device_path = device_infos.Get()[j].path;
+        std::string device_path_str(device_path.data, device_path.size);
+
+        OrtKeyValuePairs* hw_metadata = nullptr;
+        factory->ort_api.CreateKeyValuePairs(&hw_metadata);
+        factory->ort_api.AddKeyValuePair(hw_metadata, "iree.driver",
+                                         driver_name_str.c_str());
+        factory->ort_api.AddKeyValuePair(hw_metadata, "iree.device_path",
+                                         device_path_str.c_str());
+        factory->ort_api.AddKeyValuePair(hw_metadata, "iree.device_id",
+                                         std::to_string(device_index).c_str());
+
+        // TODO: We are pretending here that all IREE devices are GPUs.
+        // This is because we follow a host <-> device model in IREE.
+        OrtHardwareDeviceType device_type = OrtHardwareDeviceType_GPU;
+
+        OrtHardwareDevice* hw_device = nullptr;
+        OrtStatus* ort_status = factory->ep_api.CreateHardwareDevice(
+            device_type, kEpVendorId, static_cast<uint32_t>(device_index),
+            kEpVendor, hw_metadata, &hw_device);
+        factory->ort_api.ReleaseKeyValuePairs(hw_metadata);
+        if (ort_status != nullptr) {
+          factory->ort_api.ReleaseStatus(ort_status);
+          continue;
+        }
+
+        factory->hw_devices_.push_back(hw_device);
+
+        // Create MemoryInfo for device-local memory. These must stay alive
+        // for the factory lifetime since EpDevice_AddAllocatorInfo stores
+        // the pointer without copying.
+        factory->device_memory_infos_.emplace_back(
+            "IREE",                               // name
+            OrtMemoryInfoDeviceType_GPU,          // device_type
+            kEpVendorId,                          // vendor_id
+            static_cast<uint32_t>(device_index),  // device_id
+            OrtDeviceMemoryType_DEFAULT,          // mem_type
+            0,                                    // alignment (default)
+            OrtDeviceAllocator);                  // allocator_type
+
+        ++device_index;
+      }
+    }
+  }
+
+  // Create OrtEpDevice for each enumerated hardware device.
+  // ORT takes ownership of OrtEpDevice objects.
   for (size_t i = 0;
        i < factory->hw_devices_.size() && num_ep_devices < max_ep_devices;
        ++i) {
@@ -324,29 +327,10 @@ OrtStatus* ORT_API_CALL IreeEpFactory::GetSupportedDevicesImpl(
     ORT_RETURN_IF_ERROR(factory->ep_api.CreateEpDevice(
         factory, factory->hw_devices_[i], nullptr, nullptr, &ep_device));
 
-    // Register allocator info for device-local memory.
-    // This tells ORT that this device has an allocator available for
-    // device-local memory allocations.
-    //
-    // IMPORTANT: EpDevice_AddAllocatorInfo does NOT copy the OrtMemoryInfo,
-    // it just stores the pointer. We must keep the memory_info alive for
-    // the lifetime of the factory by storing it in device_memory_infos_.
-    factory->device_memory_infos_.emplace_back(
-        "IREE",                       // name
-        OrtMemoryInfoDeviceType_GPU,  // device_type
-        kEpVendorId,                  // vendor_id
-        static_cast<uint32_t>(i),     // device_id
-        OrtDeviceMemoryType_DEFAULT,  // mem_type
-        0,                            // alignment (default)
-        OrtDeviceAllocator);          // allocator_type
-
-    // Get raw pointer to pass to ORT.
-    const OrtMemoryInfo* mem_info_ptr = factory->device_memory_infos_.back();
-
+    const OrtMemoryInfo* mem_info_ptr = factory->device_memory_infos_[i];
     OrtStatus* add_alloc_status =
         factory->ep_api.EpDevice_AddAllocatorInfo(ep_device, mem_info_ptr);
     if (add_alloc_status != nullptr) {
-      factory->device_memory_infos_.pop_back();
       factory->ep_api.ReleaseEpDevice(ep_device);
       return add_alloc_status;
     }
@@ -439,13 +423,11 @@ OrtStatus* ORT_API_CALL IreeEpFactory::CreateEpImpl(
         .release();
   }
 
-  // Require target_arch for non-CPU devices.
-  OrtHardwareDeviceType device_type =
-      factory->ort_api.HardwareDevice_Type(&hardware_device);
-  if (device_type != OrtHardwareDeviceType_CPU && config.target_arch.empty()) {
+  // Require target_arch for GPU backends (llvm-cpu defaults to host).
+  if (config.backend != "llvm-cpu" && config.target_arch.empty()) {
     return Ort::Status(
-               "IREE EP: 'target_arch' option must be specified for non-CPU "
-               "devices",
+               "IREE EP: 'target_arch' option must be specified for "
+               "hip, cuda, and vulkan backends",
                ORT_INVALID_ARGUMENT)
         .release();
   }
