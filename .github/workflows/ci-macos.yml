@@ -34,7 +34,7 @@ jobs:
       - name: Install Python package
         run: |
           ONNXRUNTIME_EP_IREE_BUILD_DIR=${{ github.workspace }}/${BUILD_DIR} \
-            pip install -e python/
+            pip install python/
 
       - name: Run tests
         run: pytest test/ -v

@@ -1,7 +1,0 @@
-{
-  global:
-    CreateEpFactories;
-    ReleaseEpFactory;
-  local:
-    *;
-};

@@ -36,13 +36,10 @@ jobs:
       - name: Install Python package
         run: |
           ONNXRUNTIME_EP_IREE_BUILD_DIR=${{ github.workspace }}/${BUILD_DIR} \
-            pip install -e python/
+            pip install python/
 
       - name: Run tests
         run: pytest test/ -v
 
       - name: Run ExternDispatch tests
-        run: |
-          pytest test/test_extern_dispatch.py \
-            --ep-lib ${{ github.workspace }}/${BUILD_DIR}/libonnxruntime_ep_iree.so \
-            -v
+        run: pytest test/test_extern_dispatch.py -v

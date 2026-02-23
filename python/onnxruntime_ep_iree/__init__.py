@@ -5,7 +5,11 @@ Provides functions to locate the native EP shared library and its registration n
 
 from pathlib import Path
 
-__all__ = ["get_library_path", "get_ep_name", "get_ep_names"]
+__all__ = [
+    "get_library_path",
+    "get_ep_name",
+    "get_ep_names",
+]
 
 _LIB_NAMES = [
     "libonnxruntime_ep_iree.dylib",
