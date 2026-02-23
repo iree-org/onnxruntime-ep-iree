@@ -64,12 +64,9 @@ endif()
 # When not specified, FetchContent the IREE sources from GitHub at the tag
 # specified by `IREE_GIT_TAG`.
 #
-# We choose not to take a source dependency on the IREE compiler, which is
-# quite heavy and can be slow to build. It is left to the consumer of the EP to
-# make sure iree compiler tooling scripts are available in their environment.
-# This can be generally done by `pip install iree-base-compiler`.
-
-# We may in future decide to build the IREE compiler from source.
+# The EP dynamically loads libIREECompiler.so at runtime via dlopen (no
+# compile-time linking to the compiler). The loader source and C API headers
+# come from the IREE source tree (compiler/bindings/c/).
 #
 ################################################################################
 
@@ -81,7 +78,7 @@ set(IREE_GIT_TAG "v3.10.0")
 set(IREE_SOURCE_DIR "" CACHE FILEPATH "Path to IREE source")
 
 # Set IREE build flags.
-set(IREE_VISIBILITY_HIDDEN OFF)
+set(IREE_VISIBILITY_HIDDEN ON)
 set(IREE_BUILD_COMPILER OFF)
 set(IREE_BUILD_TESTS OFF)
 set(IREE_BUILD_SAMPLES OFF)
@@ -100,6 +97,9 @@ set(IREE_HAL_DRIVER_VULKAN ON)
 
 if(IREE_SOURCE_DIR)
   message(STATUS "Using existing IREE sources: ${IREE_SOURCE_DIR}")
+  # Normalize so downstream code can use iree_SOURCE_DIR unconditionally
+  # (FetchContent sets this automatically; local source needs it explicitly).
+  set(iree_SOURCE_DIR "${IREE_SOURCE_DIR}")
   add_subdirectory(${IREE_SOURCE_DIR} iree SYSTEM EXCLUDE_FROM_ALL)
 else()
   message(STATUS "Fetching IREE sources from tag ${IREE_GIT_TAG}")
@@ -128,6 +128,110 @@ else()
   endif()
 endif()
 
+################################################################################
+# Compiler Loader
+#
+# The EP uses the IREE compiler C API (embedding_api.h) via a dynamic loader
+# (loader.h / loader.cpp). At runtime, the EP loads libIREECompiler.so via
+# dlopen — there is no compile-time linking to the compiler. The loader source
+# and C API headers come from the IREE source tree.
+#
+# At runtime, the compiler library is resolved in this order:
+#   1. Session option: ep.iree.compiler_lib_path (explicit path)
+#   2. Env var: IREE_EP_COMPILER_LIB (full path to library file)
+#   3. Env var: IREE_EP_COMPILER_LIB_DIR (directory to search)
+#   4. Build-time default: -DIREE_COMPILER_LIB_DIR (baked into binary)
+#   5. Relative to EP .so: iree/compiler/_mlir_libs/ (pip co-installs)
+#   6. Fallback: dlopen("libIREECompiler.so") via standard search paths
+#
+################################################################################
+
+# Cache var with env-var default: users can set IREE_COMPILER_LIB_DIR in the
+# environment OR pass -DIREE_COMPILER_LIB_DIR=... on the cmake command line.
+# The explicit -D flag always wins over the environment variable.
+set(IREE_COMPILER_LIB_DIR "$ENV{IREE_COMPILER_LIB_DIR}" CACHE PATH
+  "Directory containing libIREECompiler.so (compile-time default for runtime search)")
+
+# When ON, cmake will FATAL_ERROR if the compiler library is not found at
+# configure time. Default OFF for development flexibility — the EP can still
+# discover the library at runtime via session options or dlopen search paths.
+option(IREE_EP_REQUIRE_COMPILER_LIB
+  "Require IREE compiler library to be found at configure time" OFF)
+
+# Auto-detect the pip-installed iree-base-compiler library directory.
+# Uses Python3_FIND_VIRTUALENV FIRST so venv interpreters are preferred.
+if(NOT IREE_COMPILER_LIB_DIR)
+  set(Python3_FIND_VIRTUALENV FIRST)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_FOUND)
+    message(STATUS "Using Python interpreter for compiler detection: ${Python3_EXECUTABLE}")
+    execute_process(
+      COMMAND "${Python3_EXECUTABLE}" -c
+        "import iree.compiler._mlir_libs as m; from pathlib import Path; print(Path(m.__file__).parent)"
+      OUTPUT_VARIABLE _pip_compiler_lib_dir
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+      RESULT_VARIABLE _pip_result
+    )
+    if(_pip_result EQUAL 0 AND _pip_compiler_lib_dir)
+      # Persist in cache so subsequent reconfigures (e.g. without venv active)
+      # don't lose the detected path.
+      set(IREE_COMPILER_LIB_DIR "${_pip_compiler_lib_dir}" CACHE PATH
+        "Directory containing libIREECompiler.so (compile-time default for runtime search)" FORCE)
+      message(STATUS "Auto-detected pip-installed IREE compiler: ${IREE_COMPILER_LIB_DIR}")
+    else()
+      message(STATUS "iree-base-compiler not found via ${Python3_EXECUTABLE}")
+    endif()
+  else()
+    message(STATUS "Python3 interpreter not found; skipping pip compiler detection")
+  endif()
+endif()
+
+# Validate the detected/configured directory.
+if(IREE_COMPILER_LIB_DIR)
+  # Resolve to real path (canonicalize symlinks, relative paths).
+  get_filename_component(IREE_COMPILER_LIB_DIR "${IREE_COMPILER_LIB_DIR}" REALPATH)
+
+  # Check that the directory actually contains a compiler library.
+  set(_iree_compiler_lib_found FALSE)
+  foreach(_lib_name "libIREECompiler.so" "libIREECompiler.dylib" "IREECompiler.dll")
+    if(EXISTS "${IREE_COMPILER_LIB_DIR}/${_lib_name}")
+      set(_iree_compiler_lib_found TRUE)
+      message(STATUS "IREE compiler library: ${IREE_COMPILER_LIB_DIR}/${_lib_name}")
+      break()
+    endif()
+  endforeach()
+  if(NOT _iree_compiler_lib_found)
+    message(WARNING
+      "IREE_COMPILER_LIB_DIR is set to '${IREE_COMPILER_LIB_DIR}' "
+      "but no compiler library (libIREECompiler.so/.dylib/IREECompiler.dll) was found there.")
+    # Clear invalid directory so it's not baked into the binary.
+    set(IREE_COMPILER_LIB_DIR "")
+  endif()
+  unset(_iree_compiler_lib_found)
+endif()
+
+# Final status/error reporting.
+if(IREE_COMPILER_LIB_DIR)
+  message(STATUS "IREE compiler library directory: ${IREE_COMPILER_LIB_DIR}")
+elseif(IREE_EP_REQUIRE_COMPILER_LIB)
+  message(FATAL_ERROR
+    "IREE compiler library not found and IREE_EP_REQUIRE_COMPILER_LIB is ON.\n"
+    "Either:\n"
+    "  - Set IREE_COMPILER_LIB_DIR env var or -DIREE_COMPILER_LIB_DIR=<path>, or\n"
+    "  - Activate a virtualenv with iree-base-compiler before running cmake, or\n"
+    "  - Set -DIREE_EP_REQUIRE_COMPILER_LIB=OFF to allow runtime discovery")
+else()
+  message(WARNING
+    "IREE compiler library not found at configure time.\n"
+    "The EP will rely on runtime discovery (session option, env var, or dlopen search paths).\n"
+    "To bake the path into the binary, either:\n"
+    "  - Set IREE_COMPILER_LIB_DIR env var or -DIREE_COMPILER_LIB_DIR=<path>, or\n"
+    "  - Activate a virtualenv with iree-base-compiler before running cmake")
+endif()
+
+set(IREE_COMPILER_BINDINGS_DIR "${iree_SOURCE_DIR}/compiler/bindings/c")
+
 # Build shared library (EP plugin)
 add_library(onnxruntime_ep_iree SHARED
   src/plugin_entry.cc
@@ -141,20 +245,61 @@ add_library(onnxruntime_ep_iree SHARED
   src/temp_file.cc
 )
 
+# Build IREE compiler loader as a static library. The loader's trampoline
+# functions use IREE_EMBED_EXPORTED (visibility("default")) which we can't
+# override at compile time. Instead, --exclude-libs localizes all symbols
+# from this archive when linking into our shared library.
+add_library(iree_compiler_loader STATIC
+  ${IREE_COMPILER_BINDINGS_DIR}/iree/compiler/loader/loader.cpp
+)
+set_target_properties(iree_compiler_loader PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(iree_compiler_loader PRIVATE
+  ${IREE_COMPILER_BINDINGS_DIR}
+)
+if(MSVC)
+  target_compile_options(iree_compiler_loader PRIVATE /w)
+else()
+  target_compile_options(iree_compiler_loader PRIVATE -w)
+endif()
+
 # Statically link IREE runtime and io/parameter libraries.
+# Link dl for dlopen/dlsym (compiler loader).
 target_link_libraries(onnxruntime_ep_iree PRIVATE
   iree_runtime_unified
   iree_io_parameter_index
   iree_io_parameter_index_provider
   iree_io_formats_irpa_irpa
   iree_modules_io_parameters_parameters
+  iree_compiler_loader
+  ${CMAKE_DL_LIBS}
 )
 
+# Localize all symbols from the compiler loader static library so its
+# IREE_EMBED_EXPORTED trampolines don't leak into our public symbol table.
+if(UNIX AND NOT APPLE)
+  # GNU ld: hide all symbols from the loader's static archive.
+  target_link_options(onnxruntime_ep_iree PRIVATE
+    "LINKER:--exclude-libs,libiree_compiler_loader.a"
+  )
+elseif(APPLE)
+  # macOS ld: generate an unexported symbols list from the loader's trampolines.
+  # The ireeCompiler* symbols are generated by loader.cpp with
+  # visibility("default") — we re-hide them here.
+  set(_unexport_file "${CMAKE_CURRENT_BINARY_DIR}/iree_loader_unexported.txt")
+  file(WRITE "${_unexport_file}" "_ireeCompiler*\n")
+  target_link_options(onnxruntime_ep_iree PRIVATE
+    "LINKER:-unexported_symbols_list,${_unexport_file}"
+  )
+endif()
+# On Windows, MSVC only exports symbols explicitly marked __declspec(dllexport),
+# so the loader trampolines (which use visibility("default"), a no-op on MSVC)
+# are not exported. No additional linker flags needed.
 
 # Include directories
 target_include_directories(onnxruntime_ep_iree PRIVATE
   ${IREE_EP_ONNX_SRC_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${IREE_COMPILER_BINDINGS_DIR}
 )
 
 # Compiler flags
@@ -173,23 +318,22 @@ else()
   )
 endif()
 
-# Export symbols for plugin loading
-if(MSVC)
-  # Windows: Use .def file (ORT_EXPORT is defined as empty in ORT headers on Windows)
-  set_target_properties(onnxruntime_ep_iree PROPERTIES
-    LINK_FLAGS "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/symbols.def"
-  )
-elseif(UNIX AND NOT APPLE)
-  # Linux: Use version script
-  set_target_properties(onnxruntime_ep_iree PROPERTIES
-    LINK_FLAGS "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/symbols.lds"
-  )
-elseif(APPLE)
-  # macOS: Export all symbols
-  set_target_properties(onnxruntime_ep_iree PROPERTIES
-    LINK_FLAGS "-Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/src/symbols.txt"
+# Pass build-time compiler library directory as a compile definition.
+if(IREE_COMPILER_LIB_DIR)
+  target_compile_definitions(onnxruntime_ep_iree PRIVATE
+    IREE_COMPILER_LIB_DIR="${IREE_COMPILER_LIB_DIR}"
   )
 endif()
+
+# Hide all symbols by default. Only plugin entry points (CreateEpFactories,
+# ReleaseEpFactory) are exported via explicit visibility("default") attributes.
+# VISIBILITY_INLINES_HIDDEN suppresses weak inline/template symbols (e.g.
+# std::format, libstdc++ internals) that would otherwise leak into the ABI.
+set_target_properties(onnxruntime_ep_iree PROPERTIES
+  CXX_VISIBILITY_PRESET hidden
+  C_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON
+)
 
 # Install
 install(TARGETS onnxruntime_ep_iree

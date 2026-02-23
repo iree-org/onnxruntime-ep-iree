@@ -13,10 +13,20 @@
 #include "iree_ep_factory.h"
 #include "ort_import.h"
 
+// ORT_EXPORT is a no-op on Linux. Define EP_EXPORT with explicit visibility
+// so that only the plugin entry points are exported from the shared library.
+// Combined with CXX_VISIBILITY_PRESET=hidden in CMake, this ensures all
+// statically-linked IREE runtime symbols remain hidden.
+#if defined(_WIN32)
+#define EP_EXPORT __declspec(dllexport)
+#else
+#define EP_EXPORT __attribute__((visibility("default")))
+#endif
+
 extern "C" {
 
 // Plugin entry point - creates EP factories.
-ORT_EXPORT OrtStatus* CreateEpFactories(const char* registration_name,
+EP_EXPORT OrtStatus* CreateEpFactories(const char* registration_name,
                                         const OrtApiBase* ort_api_base,
                                         const OrtLogger* default_logger,
                                         OrtEpFactory** factories,
@@ -47,7 +57,7 @@ ORT_EXPORT OrtStatus* CreateEpFactories(const char* registration_name,
 }
 
 // Plugin cleanup
-ORT_EXPORT OrtStatus* ReleaseEpFactory(OrtEpFactory* factory) {
+EP_EXPORT OrtStatus* ReleaseEpFactory(OrtEpFactory* factory) {
   delete static_cast<onnxruntime::iree::IreeEpFactory*>(factory);
   return nullptr;
 }

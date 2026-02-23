@@ -5,7 +5,11 @@ Provides functions to locate the native EP shared library and its registration n
 
 from pathlib import Path
 
-__all__ = ["get_library_path", "get_ep_name", "get_ep_names"]
+__all__ = [
+    "get_library_path",
+    "get_ep_name",
+    "get_ep_names",
+]
 
 _LIB_NAMES = [
     "libonnxruntime_ep_iree.dylib",
@@ -55,6 +59,7 @@ def get_library_path() -> str:
         "IREE EP library not found. "
         "Make sure the C++ library has been built (cmake -B build -GNinja && ninja -C build)."
     )
+
 
 
 def get_ep_name() -> str:

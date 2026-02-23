@@ -16,6 +16,7 @@
 #include <memory>
 
 #include "iree_allocator.h"
+#include "iree_compile.h"
 #include "iree_data_transfer.h"
 #include "iree_ep.h"
 
@@ -147,6 +148,11 @@ IreeEpFactory::~IreeEpFactory() {
   // Note: Avoid excessive logging during cleanup - ORT logging infrastructure
   // may be torn down before our destructors run during Python interpreter
   // shutdown.
+
+  // The compiler is process-global (loaded via dlopen) — do NOT shut it down
+  // here. Multiple factories may share it, and the IREE compiler C API does
+  // not support re-initialization after shutdown. The loaded library persists
+  // until process exit, which is the correct behavior for dlopen'd resources.
 
   // Clean up in proper order: allocators first (they reference devices),
   // then data transfer, then devices, finally hardware devices.
@@ -346,6 +352,7 @@ OrtStatus* ORT_API_CALL IreeEpFactory::CreateEpImpl(
   // Parse configuration from session options config entries.
   // The Python API stores options with "ep.iree." prefix.
   IreeEp::Config config = {};
+  std::string compiler_lib_path;
   if (session_options != nullptr) {
     Ort::ConstSessionOptions sess_opts(session_options);
     config.target_arch =
@@ -354,6 +361,29 @@ OrtStatus* ORT_API_CALL IreeEpFactory::CreateEpImpl(
         sess_opts.GetConfigEntryOrDefault("ep.iree.opt_level", "O0");
     config.save_intermediates = sess_opts.GetConfigEntryOrDefault(
                                     "ep.iree.save_intermediates", "0") == "1";
+    // compiler_lib_path is a process-global setting (first init wins), not
+    // per-session. It's parsed here because session options are the only way
+    // to pass it from the Python API.
+    compiler_lib_path =
+        sess_opts.GetConfigEntryOrDefault("ep.iree.compiler_lib_path", "");
+  }
+
+  // Initialize the compiler (thread-safe, first call wins).
+  // If compiler_lib_path is empty, auto-discovery finds the pip-installed
+  // or build-time-configured compiler library.
+  if (IreeCompiler::IsInitialized() && !compiler_lib_path.empty()) {
+    ORT_CXX_LOGF_NOEXCEPT(factory->logger_, ORT_LOGGING_LEVEL_WARNING,
+                           "IREE EP: Compiler already initialized; ignoring "
+                           "ep.iree.compiler_lib_path='%s' from this session. "
+                           "The compiler is process-global (first init wins).",
+                           compiler_lib_path.c_str());
+  }
+  {
+    OrtStatus* compiler_status =
+        IreeCompiler::Initialize(compiler_lib_path);
+    if (compiler_status != nullptr) {
+      return compiler_status;
+    }
   }
 
   // Select backend based on driver.

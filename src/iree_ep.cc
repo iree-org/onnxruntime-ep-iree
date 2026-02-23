@@ -186,7 +186,7 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: Generating VMFB");
   ORT_RETURN_IF_ERROR(
-      CompileToVmfb(mlir_file.Path(), vmfb_file.Path(), flags, ep->ort_api));
+      IreeCompiler::CompileToVmfb(mlir_file.Path(), vmfb_file.Path(), flags));
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: VMFB Generated Successfully");
 
