@@ -86,15 +86,13 @@ static OrtStatus* ParseSpec(DimSpecParseCursor& cursor, DimSpec& dim) {
          Peek(cursor) != ';') {
     ++cursor.pos;
   }
-  if (IsAtEnd(cursor) || Peek(cursor) != '(') {
-    std::string_view bad =
-        Trim(cursor.input.substr(spec_start, cursor.pos - spec_start));
-    return DimSpecError(
-        std::format("dim_specs: missing '(' in \"{}\"", std::string(bad)));
-  }
-
   std::string_view name =
       Trim(cursor.input.substr(spec_start, cursor.pos - spec_start));
+  if (IsAtEnd(cursor) || Peek(cursor) != '(') {
+    return DimSpecError(
+        std::format("dim_specs: missing '(' in \"{}\"", std::string(name)));
+  }
+
   if (name.empty()) {
     return DimSpecError(
         std::format("dim_specs: empty name in \"{}\"",
@@ -130,14 +128,6 @@ static OrtStatus* ParseSpec(DimSpecParseCursor& cursor, DimSpec& dim) {
   }
   ++cursor.pos;  // Consume ')'.
 
-  // Only whitespace is allowed after ')' before ',' / ';' / end.
-  SkipWhitespace(cursor);
-  if (!IsAtEnd(cursor) && Peek(cursor) != ',' && Peek(cursor) != ';') {
-    return DimSpecError(
-        std::format("dim_specs: unexpected characters after ')' for \"{}\"",
-                    symbolic_name));
-  }
-
   if (min_val < 0) {
     return DimSpecError(
         std::format("dim_specs: min must be >= 0, got {} for \"{}\"", min_val,
@@ -162,13 +152,9 @@ static OrtStatus* ParseVariant(DimSpecParseCursor& cursor,
                                DimSpecVariant& variant) {
   std::unordered_set<std::string> seen_symbolic_names;
 
-  while (true) {
-    SkipWhitespace(cursor);
-    if (IsAtEnd(cursor) || Peek(cursor) == ';') {
-      return nullptr;
-    }
+  while (SkipWhitespace(cursor), !IsAtEnd(cursor) && Peek(cursor) != ';') {
+    // Ignore empty entries like ",,".
     if (Peek(cursor) == ',') {
-      // Preserve prior behavior: ignore empty entries like ",,".
       ++cursor.pos;
       continue;
     }
@@ -190,6 +176,7 @@ static OrtStatus* ParseVariant(DimSpecParseCursor& cursor,
     }
     ++cursor.pos;  // Consume comma between specs.
   }
+  return nullptr;
 }
 
 static OrtStatus* ParseDimSpecsImpl(std::string_view spec_str,
