@@ -1,0 +1,40 @@
+name: CI (macOS)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    env:
+      BUILD_DIR: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        run: brew install ninja
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: CMake - configure
+        run: cmake -G Ninja -B ${BUILD_DIR} -DCMAKE_BUILD_TYPE=Release
+
+      - name: CMake - build
+        run: cmake --build ${BUILD_DIR}
+
+      - name: Install Python package
+        run: |
+          ONNXRUNTIME_EP_IREE_BUILD_DIR=${{ github.workspace }}/${BUILD_DIR} \
+            pip install -e python/
+
+      - name: Run tests
+        run: pytest test/ -v

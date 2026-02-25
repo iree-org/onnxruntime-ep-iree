@@ -95,8 +95,11 @@ set(IREE_HAL_DRIVER_LOCAL_TASK ON)
 # Enable HIP driver for ROCm GPU execution.
 set(IREE_HAL_DRIVER_HIP ON)
 set(IREE_HIP_TEST_TARGET_CHIP "" CACHE STRING "Enable ROCm testing on specific architecture (e.g. gfx942)")
-# Enable Vulkan driver for GPU execution.
-set(IREE_HAL_DRIVER_VULKAN ON)
+# Enable Vulkan driver for GPU execution (disabled on Apple — IREE's Vulkan
+# dynamic_symbols.cc has a pointer alignment error on macOS ARM64).
+if(NOT APPLE)
+  set(IREE_HAL_DRIVER_VULKAN ON)
+endif()
 
 if(IREE_SOURCE_DIR)
   message(STATUS "Using existing IREE sources: ${IREE_SOURCE_DIR}")
