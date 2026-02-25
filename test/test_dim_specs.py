@@ -123,7 +123,12 @@ def _run_matmul(session, batch, seq, hidden, weight_data):
 
 
 def _get_new_mlir_files(before):
-    """Return set of new MLIR files created since `before` snapshot."""
+    """Return set of new MLIR files created since `before` snapshot.
+
+    WARNING: Not safe for parallel pytest execution (e.g., pytest-xdist).
+    Other processes creating iree_ep_*.mlir files in the system temp dir
+    between the before/after snapshots would produce false positives.
+    """
     temp_dir = tempfile.gettempdir()
     after = set(glob.glob(os.path.join(temp_dir, "iree_ep_*.mlir")))
     return after - before

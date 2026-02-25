@@ -42,7 +42,12 @@ def _create_simple_model():
 
 
 def _get_iree_temp_files():
-    """Return lists of IREE temp files (mlir, vmfb, irpa) in the temp directory."""
+    """Return lists of IREE temp files (mlir, vmfb, irpa) in the temp directory.
+
+    WARNING: Not safe for parallel pytest execution (e.g., pytest-xdist).
+    Other processes creating iree_ep_* files in the system temp dir between
+    snapshots would produce false positives.
+    """
     temp_dir = tempfile.gettempdir()
     mlir_files = glob.glob(os.path.join(temp_dir, "iree_ep_*.mlir"))
     vmfb_files = glob.glob(os.path.join(temp_dir, "iree_ep_*.vmfb"))
