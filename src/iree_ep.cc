@@ -194,11 +194,12 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
   // Variants are dispatched in user-specified order (first match wins).
   // Preserving caller order makes precedence explicit for overlaps.
 
-  // Create temp files: one combined MLIR, one VMFB, one IRPA.
+  // Create temp files for intermediate artifacts.
   TempFile mlir_file(".mlir");
   TempFile vmfb_file(".vmfb");
   TempFile irpa_file(".irpa");
 
+  // If save_intermediates is enabled, mark files to be kept for debugging.
   if (ep->config_.save_intermediates) {
     mlir_file.Keep();
     vmfb_file.Keep();

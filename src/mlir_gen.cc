@@ -140,7 +140,6 @@ std::string GetElementType(ONNXTensorElementDataType dtype,
 }
 
 // Formats a tensor type as !torch.vtensor<[dims],dtype>.
-// Dynamic dims are always emitted as "?".
 std::string FormatTensorType(const Ort::ConstTypeInfo& type_info) {
   if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
     return "NYI";  // NYI: non-tensor types.
@@ -156,7 +155,13 @@ std::string FormatTensorType(const Ort::ConstTypeInfo& type_info) {
     if (i > 0) {
       ss << ",";
     }
-    ss << (shape[i] < 0 ? "?" : std::to_string(shape[i]));
+    if (shape[i] < 0) {
+      // TODO: Ensure that dynamic dimensions are actually represented as -1. I
+      // checked and they seem to but an example to check would be good.
+      ss << "?";
+    } else {
+      ss << shape[i];
+    }
   }
   ss << "]," << GetElementType(dtype) << ">";
   return ss.str();
@@ -164,7 +169,6 @@ std::string FormatTensorType(const Ort::ConstTypeInfo& type_info) {
 
 // Formats a tensor type as tensor<dimsxdtype> (standard MLIR format).
 // Uses signless integer types as required by MLIR tensor dialect.
-// Dynamic dims are always emitted as "?".
 std::string FormatMlirTensorType(const Ort::ConstTypeInfo& type_info) {
   if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
     return "NYI";
@@ -177,7 +181,11 @@ std::string FormatMlirTensorType(const Ort::ConstTypeInfo& type_info) {
   std::ostringstream ss;
   ss << "tensor<";
   for (size_t i = 0; i < shape.size(); ++i) {
-    ss << (shape[i] < 0 ? "?" : std::to_string(shape[i]));
+    if (shape[i] < 0) {
+      ss << "?";
+    } else {
+      ss << shape[i];
+    }
     ss << "x";
   }
   ss << GetElementType(dtype, /*signless=*/true) << ">";
@@ -242,12 +250,16 @@ class MlirGenerator {
     auto inputs = graph_.GetInputs();
     auto initializers = graph_.GetInitializers();
 
+    // Build set of initializer names.
     std::unordered_set<std::string> init_names;
     for (const auto& init : initializers) {
       init_names.insert(init.GetName());
     }
+
+    // Graph inputs are those not in initializers.
     for (const auto& input : inputs) {
-      if (!init_names.contains(input.GetName())) {
+      std::string name = input.GetName();
+      if (init_names.find(name) == init_names.end()) {
         graph_inputs_.push_back(input);
       }
     }
@@ -330,6 +342,7 @@ class MlirGenerator {
   // Constrained input args are renamed to %name__orig so EmitDimConstraints()
   // can rebind the original name after applying shape assumptions.
   void EmitFunctionHeader() {
+    // Build function arguments.
     std::ostringstream args;
     for (size_t i = 0; i < graph_inputs_.size(); ++i) {
       if (i > 0) {
@@ -344,6 +357,7 @@ class MlirGenerator {
       }
     }
 
+    // Build return types.
     std::ostringstream ret_types;
     for (size_t i = 0; i < graph_outputs_.size(); ++i) {
       if (i > 0) {
@@ -412,30 +426,30 @@ class MlirGenerator {
     size_t byte_size = tensor_info.GetElementCount() *
                        OnnxElementTypeSize(tensor_info.GetElementType());
 
-    if (byte_size > kMaxInlineInitializerSize) {
-      // Large: reference IRPA parameter archive.
+    if (byte_size <= kMaxInlineInitializerSize) {
+      // Small: inline with dense<> DenseElementsAttr.
+      Ort::ConstValue tensor_value{nullptr};
+      auto status = init.GetInitializer(tensor_value);
+      if (!status.IsOK()) {
+        return;
+      }
+      const auto* data =
+          static_cast<const uint8_t*>(tensor_value.GetTensorRawData());
+      std::string hex = HexEncode(data, tensor_value.GetTensorSizeInBytes());
+
+      constexpr std::string_view schema =
+          R"(    %__raw_{0} = flow.tensor.constant dense<"{3}"> : {1}
+    %{0} = torch_c.from_builtin_tensor %__raw_{0} : {1} -> {2}
+)";
+      out_ << std::format(schema, name, tensor_type, vtensor_type, hex);
+    } else {
+      // Large: parameter reference. Data stored in IRPA archive.
       constexpr std::string_view schema =
           R"(    %__raw_{0} = flow.tensor.constant #flow.parameter.named<"model"::"{0}"> : {1}
     %{0} = torch_c.from_builtin_tensor %__raw_{0} : {1} -> {2}
 )";
       out_ << std::format(schema, name, tensor_type, vtensor_type);
-      return;
     }
-
-    // Small: inline with dense<> DenseElementsAttr.
-    Ort::ConstValue tensor_value{nullptr};
-    auto status = init.GetInitializer(tensor_value);
-    if (!status.IsOK()) return;
-
-    const auto* data =
-        static_cast<const uint8_t*>(tensor_value.GetTensorRawData());
-    std::string hex = HexEncode(data, tensor_value.GetTensorSizeInBytes());
-
-    constexpr std::string_view schema =
-        R"(    %__raw_{0} = flow.tensor.constant dense<"{3}"> : {1}
-    %{0} = torch_c.from_builtin_tensor %__raw_{0} : {1} -> {2}
-)";
-    out_ << std::format(schema, name, tensor_type, vtensor_type, hex);
   }
 
   void EmitNode(const Ort::ConstNode& node) {
@@ -451,10 +465,12 @@ class MlirGenerator {
     size_t valid_output_count = 0;
     for (size_t i = 0; i < outputs.size(); ++i) {
       if (!outputs[i]) {
+        // Skip invalid outputs (optional outputs can be empty/null).
         continue;
       }
       std::string output_name = outputs[i].GetName();
       if (output_name.empty()) {
+        // Skip empty outputs.
         continue;
       }
       if (!first_output) {
@@ -463,8 +479,7 @@ class MlirGenerator {
       }
       first_output = false;
       valid_output_count++;
-      std::string sanitized = SanitizeName(output_name);
-      out_names << "%" << sanitized;
+      out_names << "%" << SanitizeName(output_name);
       out_types << FormatTensorType(outputs[i].TypeInfo());
     }
 
@@ -474,6 +489,7 @@ class MlirGenerator {
     bool first_input = true;
     for (size_t i = 0; i < inputs.size(); ++i) {
       if (!inputs[i]) {
+        // Skip invalid inputs (optional inputs can be empty/null).
         continue;
       }
       std::string input_name = inputs[i].GetName();
@@ -485,8 +501,7 @@ class MlirGenerator {
         in_types << ", ";
       }
       first_input = false;
-      std::string sanitized = SanitizeName(input_name);
-      in_names << "%" << sanitized;
+      in_names << "%" << SanitizeName(input_name);
       in_types << FormatTensorType(inputs[i].TypeInfo());
     }
 
