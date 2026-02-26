@@ -165,36 +165,36 @@ def test_with_save_intermediates(iree_device):
         mlir_content = open(list(new_mlir)[0]).read()
 
         # D_small and D_ext_small should be inlined via dense<>.
-        assert 'dense<"0x' in mlir_content, (
-            "MLIR should contain inline dense<> attributes"
-        )
-        assert "dense_resource" not in mlir_content, (
-            "MLIR should not contain dense_resource (replaced by dense<>)"
-        )
-        assert "dialect_resources" not in mlir_content, (
-            "MLIR should not contain dialect_resources section"
-        )
+        assert (
+            'dense<"0x' in mlir_content
+        ), "MLIR should contain inline dense<> attributes"
+        assert (
+            "dense_resource" not in mlir_content
+        ), "MLIR should not contain dense_resource (replaced by dense<>)"
+        assert (
+            "dialect_resources" not in mlir_content
+        ), "MLIR should not contain dialect_resources section"
 
         # D_large and D_ext should use flow.parameter.named.
-        assert 'flow.parameter.named<"model"::"D_large">' in mlir_content, (
-            "MLIR should contain flow.parameter.named for D_large"
-        )
-        assert 'flow.parameter.named<"model"::"D_ext">' in mlir_content, (
-            "MLIR should contain flow.parameter.named for D_ext"
-        )
+        assert (
+            'flow.parameter.named<"model"::"D_large">' in mlir_content
+        ), "MLIR should contain flow.parameter.named for D_large"
+        assert (
+            'flow.parameter.named<"model"::"D_ext">' in mlir_content
+        ), "MLIR should contain flow.parameter.named for D_ext"
         # D_ext_small should NOT be a parameter.
-        assert 'flow.parameter.named<"model"::"D_ext_small">' not in mlir_content, (
-            "D_ext_small should be inlined, not a parameter"
-        )
+        assert (
+            'flow.parameter.named<"model"::"D_ext_small">' not in mlir_content
+        ), "D_ext_small should be inlined, not a parameter"
 
         # IRPA should contain only D_large's data (16384 bytes + header),
         # not D_ext's. If D_ext were copied it would be >32000 bytes.
         assert new_irpa, "No IRPA file was created"
         irpa_size = os.path.getsize(list(new_irpa)[0])
         assert irpa_size > 0, "IRPA should contain D_large data"
-        assert irpa_size <= 20000, (
-            f"IRPA too large ({irpa_size} bytes), external data may have been copied"
-        )
+        assert (
+            irpa_size <= 20000
+        ), f"IRPA too large ({irpa_size} bytes), external data may have been copied"
 
         _cleanup_iree_files(new_mlir, new_irpa)
     finally:

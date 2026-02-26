@@ -51,9 +51,9 @@ def test_ep_load(iree_device):
         outputs = session.run(None, {"A": a})
         result = outputs[0]
 
-        assert result.shape == expected.shape, (
-            f"Shape mismatch: {result.shape} vs {expected.shape}"
-        )
+        assert (
+            result.shape == expected.shape
+        ), f"Shape mismatch: {result.shape} vs {expected.shape}"
         np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-5)
     finally:
         pathlib.Path(model_path).unlink()

@@ -98,8 +98,9 @@ class IreeEp : public OrtEp, public ApiPtrs {
 // Compute kernel for compiled nodes.
 //
 // Stores compiled VMFB bytes and defers session creation to first execution.
-// This separates compilation (device-independent) from execution (device-bound),
-// enabling cross-machine caching: compile on machine A, execute on machine B.
+// This separates compilation (device-independent) from execution
+// (device-bound), enabling cross-machine caching: compile on machine A, execute
+// on machine B.
 //
 // NOTE: Because session creation is lazy, errors such as VMFB loading failures
 // or function lookup mismatches surface on the first Run() call rather than

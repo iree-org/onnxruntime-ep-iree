@@ -12,7 +12,7 @@ repos:
       - id: check-yaml
         # clang-format files use `---` to split for multiple languages,
         # resulting in errors like `expected a single document in the stream`
-        exclude: ".clang-format"
+        exclude: ".clang-format|.clang-tidy"
 
   - repo: https://github.com/psf/black
     rev: 25.12.0

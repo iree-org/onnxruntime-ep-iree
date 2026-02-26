@@ -172,8 +172,8 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
                           irpa_file.Path().c_str());
   }
 
-  // enable_ep_context_cache: keep only compiled artifacts (VMFB, IRPA) needed for
-  // caching. MLIR is a transient intermediate — only the final compiled
+  // enable_ep_context_cache: keep only compiled artifacts (VMFB, IRPA) needed
+  // for caching. MLIR is a transient intermediate — only the final compiled
   // artifacts are needed to skip recompilation on subsequent runs.
   if (!ep->config_.save_intermediates && ep->config_.enable_ep_context_cache) {
     vmfb_file.Keep();
@@ -211,11 +211,9 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
 
   // Read VMFB into memory. Session creation is deferred to first execution,
   // which allows the VMFB to be cached and loaded on a different device.
-  std::ifstream vmfb_stream(vmfb_file.Path(),
-                            std::ios::binary | std::ios::ate);
+  std::ifstream vmfb_stream(vmfb_file.Path(), std::ios::binary | std::ios::ate);
   if (!vmfb_stream) {
-    return Ort::Status("IREE EP: Failed to open VMFB file", ORT_FAIL)
-        .release();
+    return Ort::Status("IREE EP: Failed to open VMFB file", ORT_FAIL).release();
   }
   std::streampos vmfb_pos = vmfb_stream.tellg();
   if (vmfb_pos == std::streampos(-1) || vmfb_pos <= 0) {
@@ -304,8 +302,7 @@ OrtStatus* IreeNodeComputeInfo::InitializeSession() {
     VmModulePtr parameters_module;
     iree_io_parameter_provider_t* provider_raw = parameter_provider_.Get();
     IREE_ORT_RETURN_IF_ERROR(iree_io_parameters_module_create(
-        iree_runtime_instance_vm_instance(ep.IreeInstance()), 1,
-        &provider_raw,
+        iree_runtime_instance_vm_instance(ep.IreeInstance()), 1, &provider_raw,
         iree_runtime_instance_host_allocator(ep.IreeInstance()),
         parameters_module.ForOutput()));
     IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_append_module(
@@ -314,8 +311,7 @@ OrtStatus* IreeNodeComputeInfo::InitializeSession() {
 
   // Phase 3: Load VMFB from memory (avoids disk round-trip).
   iree_const_byte_span_t flatbuffer_data = {
-      vmfb_data_.data(),
-      static_cast<iree_host_size_t>(vmfb_data_.size())};
+      vmfb_data_.data(), static_cast<iree_host_size_t>(vmfb_data_.size())};
   IREE_ORT_RETURN_IF_ERROR(
       iree_runtime_session_append_bytecode_module_from_memory(
           session_.Get(), flatbuffer_data, iree_allocator_null()));

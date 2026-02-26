@@ -86,9 +86,9 @@ def test_io_binding(iree_gpu_device, gpu_target):
         result = output_tensor.numpy()
         expected = a + b
 
-        assert result.shape == expected.shape, (
-            f"Shape mismatch: {result.shape} vs {expected.shape}"
-        )
+        assert (
+            result.shape == expected.shape
+        ), f"Shape mismatch: {result.shape} vs {expected.shape}"
         np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-5)
     finally:
         pathlib.Path(model_path).unlink()

@@ -36,7 +36,9 @@ def pytest_collection_modifyitems(config, items):
     gpu_driver = config.getoption("--gpu")
     if gpu_driver:
         return
-    skip_gpu = pytest.mark.skip(reason="GPU tests require --gpu=<driver> (e.g. --gpu=hip)")
+    skip_gpu = pytest.mark.skip(
+        reason="GPU tests require --gpu=<driver> (e.g. --gpu=hip)"
+    )
     for item in items:
         if "gpu" in item.keywords:
             item.add_marker(skip_gpu)
