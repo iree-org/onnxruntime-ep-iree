@@ -67,7 +67,8 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
   const Ort::Logger& Logger() const { return logger_; }
 
  private:
-  // Internal version of GetDeviceForId that assumes factory_mutex_ is already held.
+  // Internal version of GetDeviceForId that assumes factory_mutex_ is already
+  // held.
   iree_hal_device_t* GetDeviceForIdLocked(uint32_t device_id);
 
   // Factory interface implementations (called via function pointers)
