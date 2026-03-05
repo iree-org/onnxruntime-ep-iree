@@ -13,6 +13,7 @@
 #include "mlir_gen.h"
 
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <format>
@@ -480,6 +481,74 @@ class MlirGenerator {
                        [](int64_t v) { return std::format("{0} : si64", v); });
         return std::format("torch.onnx.{0} = [{1}]", name,
                            Join(str_values, ", "));
+      }
+      case ORT_OP_ATTR_TENSOR: {
+        Ort::Value tensor_value{nullptr};
+        auto status = attr.GetTensorAttributeAsOrtValue(tensor_value);
+        if (!status.IsOK()) {
+          return std::format("torch.onnx.{0} = \"NYI_TENSOR_ERROR\"", name);
+        }
+        auto type_info = tensor_value.GetTensorTypeAndShapeInfo();
+        auto shape = type_info.GetShape();
+        auto dtype = type_info.GetElementType();
+        size_t count = type_info.GetElementCount();
+        const auto* raw =
+            static_cast<const uint8_t*>(tensor_value.GetTensorRawData());
+
+        // Format as dense<value> : tensor<shape x dtype>.
+        std::ostringstream dense;
+        dense << "dense<";
+        if (count == 0) {
+          dense << "[]";
+        } else if (count == 1) {
+          switch (dtype) {
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: {
+              float v = *reinterpret_cast<const float*>(raw);
+              if (v == 0.0f) {
+                dense << "0.000000e+00";
+              } else if (std::isinf(v) || std::isnan(v)) {
+                // Special float values must use hex encoding in MLIR.
+                dense << "\"" << HexEncode(raw, 4) << "\"";
+              } else {
+                dense << std::format("{:e}", v);
+              }
+              break;
+            }
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+              dense << *reinterpret_cast<const int64_t*>(raw);
+              break;
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+              dense << *reinterpret_cast<const int32_t*>(raw);
+              break;
+            default:
+              // Hex encoding is the universal fallback for MLIR's dense<>
+              // syntax — it works for any element type (f16, bf16, f64, etc.)
+              // without needing type-specific formatting.
+              dense << "\""
+                    << HexEncode(raw, count * OnnxElementTypeSize(dtype))
+                    << "\"";
+              break;
+          }
+        } else {
+          // Multi-element tensors: always hex-encode. ONNX tensor attributes
+          // are almost always single-element (e.g., ConstantOfShape fill
+          // value), so readability of multi-element cases isn't a priority.
+          dense << "\"" << HexEncode(raw, count * OnnxElementTypeSize(dtype))
+                << "\"";
+        }
+        dense << ">";
+
+        // Build tensor type using signed integer types (matching
+        // torch.onnx.value format).
+        std::ostringstream type_ss;
+        type_ss << "tensor<";
+        for (size_t j = 0; j < shape.size(); ++j) {
+          type_ss << shape[j] << "x";
+        }
+        type_ss << GetElementType(dtype, /*signless=*/false) << ">";
+
+        return std::format("torch.onnx.{0} = {1} : {2}", name, dense.str(),
+                           type_ss.str());
       }
       default:
         return std::format("torch.onnx.{0} = \"NYI\"", name);
