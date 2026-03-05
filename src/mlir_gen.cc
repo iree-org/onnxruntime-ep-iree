@@ -615,6 +615,49 @@ class MlirGenerator {
         return std::format("torch.onnx.{0} = [{1}]", name,
                            Join(str_values, ", "));
       }
+      case ORT_OP_ATTR_TENSOR: {
+        Ort::Value tensor_value{nullptr};
+        auto status = attr.GetTensorAttributeAsOrtValue(tensor_value);
+        if (!status.IsOK()) {
+          return error("Failed to read tensor attribute '{}': {}", name,
+                       status.GetErrorMessage());
+        }
+        auto type_info = tensor_value.GetTensorTypeAndShapeInfo();
+        auto shape = type_info.GetShape();
+        auto dtype = type_info.GetElementType();
+        size_t count = type_info.GetElementCount();
+        const auto* raw =
+            static_cast<const uint8_t*>(tensor_value.GetTensorRawData());
+
+        // Only splat (single-element) tensor attributes are supported.
+        // Per the ONNX spec, ConstantOfShape.value is the only TENSOR
+        // attribute that reaches an EP and it is always 1-element.
+        if (count != 1) {
+          return error(
+              "Unsupported tensor attribute '{}': expected 1-element splat, "
+              "got {} elements",
+              name, count);
+        }
+
+        // Format as dense<hex> : tensor<shape x dtype>.
+        // Hex encoding is lossless for all types and matches EmitInitializer.
+        std::string dense = std::format(
+            "dense<\"{}\">", HexEncode(raw, OnnxElementTypeSize(dtype)));
+
+        // Build tensor type using signed integer types (matching
+        // torch.onnx.value format).
+        std::ostringstream type_ss;
+        type_ss << "tensor<";
+        for (size_t j = 0; j < shape.size(); ++j) {
+          type_ss << shape[j] << "x";
+        }
+        IREE_EP_ASSIGN_OR_RETURN(std::string elem_type,
+                                 GetElementType(dtype, /*signless=*/false));
+        type_ss << elem_type << ">";
+
+        return std::format("torch.onnx.{0} = {1} : {2}", name, dense,
+                           type_ss.str());
+      }
       default:
         return error("Unsupported attribute type {} for '{}'",
                      static_cast<int>(type), name);
