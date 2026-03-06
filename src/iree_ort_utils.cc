@@ -149,6 +149,18 @@ OrtStatus* OrtTensorToIreeBufferView(const Ort::ConstValue& ort_value,
   std::vector<iree_hal_dim_t> iree_shape(shape.begin(), shape.end());
   size_t byte_size = CalculateTensorByteSize(shape, onnx_dtype);
 
+  // TODO: Remove this guard once the HIP HAL driver correctly handles empty
+  // buffer dispatch without corrupting the device queue. Empty tensors (a
+  // dimension of size 0, e.g. dynamic KV cache inputs before the first token)
+  // are valid per the ONNX spec but currently trigger a hang on HIP backends.
+  if (byte_size == 0) {
+    return Ort::Status(
+               "IREE EP: Empty tensors are not yet supported on HIP "
+               "backends",
+               ORT_INVALID_ARGUMENT)
+        .release();
+  }
+
   // Check if tensor is already on an IREE device.
   const OrtMemoryDevice* mem_device =
       ep_api.Value_GetMemoryDevice(ort_value.operator const OrtValue*());
