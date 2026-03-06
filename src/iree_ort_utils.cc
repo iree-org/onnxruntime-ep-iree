@@ -149,6 +149,14 @@ OrtStatus* OrtTensorToIreeBufferView(const Ort::ConstValue& ort_value,
   std::vector<iree_hal_dim_t> iree_shape(shape.begin(), shape.end());
   size_t byte_size = CalculateTensorByteSize(shape, onnx_dtype);
 
+  // Reject zero-element tensors. Dispatching a zero-element buffer to IREE
+  // can leave the device queue in a broken state on some backends (e.g. HIP).
+  if (byte_size == 0) {
+    return Ort::Status("IREE EP: Zero-element tensors are not supported",
+                       ORT_INVALID_ARGUMENT)
+        .release();
+  }
+
   // Check if tensor is already on an IREE device.
   const OrtMemoryDevice* mem_device =
       ep_api.Value_GetMemoryDevice(ort_value.operator const OrtValue*());
