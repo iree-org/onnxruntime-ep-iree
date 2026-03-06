@@ -63,6 +63,11 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
   // Returns nullptr if device_id is invalid.
   iree_hal_device_t* GetDeviceForId(uint32_t device_id);
 
+  // Returns the allocator for the given device_id, or nullptr if not yet
+  // created. The allocator is created by ORT during session init via
+  // CreateAllocatorImpl.
+  IreeAllocator* GetAllocatorForDevice(uint32_t device_id);
+
   // Accessor for the logger.
   const Ort::Logger& Logger() const { return logger_; }
 

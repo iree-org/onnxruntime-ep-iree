@@ -166,6 +166,15 @@ iree_hal_device_t* IreeEpFactory::GetDeviceForId(uint32_t device_id) {
   return GetDeviceForIdLocked(device_id);
 }
 
+IreeAllocator* IreeEpFactory::GetAllocatorForDevice(uint32_t device_id) {
+  std::lock_guard<std::mutex> lock(factory_mutex_);
+  auto it = allocators_.find(device_id);
+  if (it != allocators_.end()) {
+    return it->second.get();
+  }
+  return nullptr;
+}
+
 iree_hal_device_t* IreeEpFactory::GetDeviceForIdLocked(uint32_t device_id) {
   // Check if device is already cached.
   auto it = device_cache_.find(device_id);

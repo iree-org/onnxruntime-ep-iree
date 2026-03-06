@@ -46,12 +46,79 @@ IreeAllocator::~IreeAllocator() {
   // Allocations are automatically released via HalBufferPtr RAII.
 }
 
+thread_local IreeAllocator::ActiveReuse IreeAllocator::active_reuse_ = {};
+
+void IreeAllocator::SetActiveReuseQueue(ReuseQueue* queue) {
+  active_reuse_.owner = queue ? this : nullptr;
+  active_reuse_.queue = queue;
+}
+
+/*static*/
+void IreeAllocator::DrainReuseQueue(ReuseQueue& queue) {
+  while (!queue.empty()) {
+    iree_hal_buffer_release(queue.front().buffer);
+    queue.pop();
+  }
+}
+
 /*static*/
 void* ORT_API_CALL IreeAllocator::AllocImpl(OrtAllocator* this_, size_t size) {
   auto* self = static_cast<IreeAllocator*>(this_);
 
   if (size == 0) {
     return nullptr;
+  }
+
+  // Check the thread-local reuse queue. If ComputeImpl queued an IREE output
+  // buffer on THIS thread and THIS allocator, reuse it directly (zero-copy).
+  // The queue is thread-local so no lock is needed for the queue itself.
+  if (active_reuse_.owner == self && active_reuse_.queue &&
+      !active_reuse_.queue->empty()) {
+    PendingBuffer pending = active_reuse_.queue->front();
+    active_reuse_.queue->pop();
+
+    // Validate byte size. On mismatch, the queue is desynchronized —
+    // release this buffer, drain remaining entries, and fall through
+    // to a fresh allocation.
+    if (pending.byte_size != size) {
+      ORT_CXX_LOGF_NOEXCEPT(
+          self->logger_, ORT_LOGGING_LEVEL_WARNING,
+          "IREE EP: Reuse queue size mismatch (expected %zu, got %zu) — "
+          "draining queue and falling back to fresh alloc",
+          size, pending.byte_size);
+      iree_hal_buffer_release(pending.buffer);
+      DrainReuseQueue(*active_reuse_.queue);
+      // Fall through to fresh allocation below.
+    } else {
+      iree_hal_buffer_t* buffer = pending.buffer;
+
+      std::lock_guard<std::mutex> lock(self->allocations_mutex_);
+      auto it = self->allocations_.find(buffer);
+      if (it != self->allocations_.end()) {
+        // Buffer already tracked — IREE performed an in-place op (output
+        // buffer IS the input buffer). ORT will call Free once for the input
+        // tensor and once for the output tensor, so bump the ref count.
+        // Release the extra retain from ComputeImpl (we don't need a new
+        // HalBufferPtr, the existing one already owns the buffer).
+        iree_hal_buffer_release(buffer);
+        it->second.ref_count++;
+        ORT_CXX_LOGF_NOEXCEPT(
+            self->logger_, ORT_LOGGING_LEVEL_INFO,
+            "IREE EP: Output zero-copy in-place reuse (%zu bytes, buffer=%p, "
+            "ref_count=%d)",
+            size, static_cast<void*>(buffer), it->second.ref_count);
+        return buffer;
+      } else {
+        // New buffer from IREE — take ownership via HalBufferPtr.
+        // The buffer was already retained by ComputeImpl.
+        self->allocations_[buffer] = {HalBufferPtr(buffer), 1};
+        ORT_CXX_LOGF_NOEXCEPT(
+            self->logger_, ORT_LOGGING_LEVEL_INFO,
+            "IREE EP: Output zero-copy reuse (%zu bytes, buffer=%p)", size,
+            static_cast<void*>(buffer));
+        return buffer;
+      }
+    }
   }
 
   // Get the HAL allocator from the device.
@@ -89,13 +156,10 @@ void* ORT_API_CALL IreeAllocator::AllocImpl(OrtAllocator* this_, size_t size) {
   }
 
   // Store in allocations map and return the buffer pointer.
-  // TODO: We probably don't need to do this. This just adds an extra layer of
-  // validation that when the pointer is freed, we actually owned it and free
-  // any unfreed memory on teardown.
   iree_hal_buffer_t* buffer_ptr = buffer.Get();
   {
     std::lock_guard<std::mutex> lock(self->allocations_mutex_);
-    self->allocations_[buffer_ptr] = std::move(buffer);
+    self->allocations_[buffer_ptr] = {std::move(buffer), 1};
   }
 
   ORT_CXX_LOGF_NOEXCEPT(self->logger_, ORT_LOGGING_LEVEL_INFO,
@@ -119,6 +183,17 @@ void ORT_API_CALL IreeAllocator::FreeImpl(OrtAllocator* this_, void* p) {
   if (it == self->allocations_.end()) {
     ORT_CXX_LOGF_NOEXCEPT(self->logger_, ORT_LOGGING_LEVEL_WARNING,
                           "IREE EP: Attempted to free unknown buffer %p", p);
+    return;
+  }
+
+  // Decrement ref count. Only release when all ORT tensors sharing this
+  // buffer have been freed (ref_count reaches 0).
+  if (--it->second.ref_count > 0) {
+    ORT_CXX_LOGF_NOEXCEPT(
+        self->logger_, ORT_LOGGING_LEVEL_INFO,
+        "IREE EP: Decremented ref_count for buffer %p on device %u "
+        "(remaining=%d)",
+        p, self->device_id_, it->second.ref_count);
     return;
   }
 

@@ -17,6 +17,7 @@
 #define ONNXRUNTIME_EP_IREE_SRC_IREE_ALLOCATOR_H_
 
 #include <mutex>
+#include <queue>
 #include <unordered_map>
 
 #include "iree_ep_factory.h"
@@ -57,6 +58,26 @@ class IreeAllocator : public OrtAllocator {
   IreeAllocator(IreeAllocator&&) = delete;
   IreeAllocator& operator=(IreeAllocator&&) = delete;
 
+  // Queue entry: buffer pointer + expected byte size for validation.
+  struct PendingBuffer {
+    iree_hal_buffer_t* buffer;
+    size_t byte_size;
+  };
+
+  // Per-invocation reuse queue, owned by the caller (stack-local in
+  // ComputeImpl). Set as the active queue for the current thread before
+  // calling ctx.GetOutput(), so AllocImpl can pop from it. This avoids
+  // cross-thread interleaving of queued buffers.
+  using ReuseQueue = std::queue<PendingBuffer>;
+
+  // Set/clear the active reuse queue for the current thread.
+  // The owner pointer is stored alongside the queue so AllocImpl can verify
+  // that the queued buffers belong to the same allocator instance.
+  void SetActiveReuseQueue(ReuseQueue* queue);
+
+  // Release any unconsumed buffers in the given queue.
+  static void DrainReuseQueue(ReuseQueue& queue);
+
  private:
   // OrtAllocator function pointer implementations.
 
@@ -78,10 +99,30 @@ class IreeAllocator : public OrtAllocator {
   // Protects allocations_ for concurrent Alloc/Free from parallel inference.
   mutable std::mutex allocations_mutex_;
 
+  // Ref-counted buffer entry. When IREE performs an in-place op, the output
+  // buffer is the same pointer as the input — ORT holds two tensors pointing
+  // to the same buffer. The ref_count tracks how many outstanding ORT tensors
+  // reference this buffer; FreeImpl only releases when it reaches 0.
+  struct TrackedBuffer {
+    HalBufferPtr buffer;
+    int ref_count;
+  };
+
   // Tracks allocated buffers for ownership management.
   // Key: iree_hal_buffer_t* (the value returned by Alloc)
-  // Value: RAII wrapper that releases buffer on destruction.
-  std::unordered_map<void*, HalBufferPtr> allocations_;
+  // Value: RAII wrapper + ref count for shared buffer tracking.
+  std::unordered_map<void*, TrackedBuffer> allocations_;
+
+  // Thread-local reuse state for the current ComputeImpl invocation.
+  // Stores both the owning allocator and queue pointer so AllocImpl can
+  // verify the queued buffers belong to the correct allocator instance.
+  // Each thread has its own state, so concurrent ComputeImpl calls on
+  // different threads never interfere with each other.
+  struct ActiveReuse {
+    IreeAllocator* owner = nullptr;
+    ReuseQueue* queue = nullptr;
+  };
+  static thread_local ActiveReuse active_reuse_;
 };
 
 }  // namespace onnxruntime::iree

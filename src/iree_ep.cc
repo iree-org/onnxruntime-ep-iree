@@ -14,10 +14,12 @@
 #include "iree_ep.h"
 
 #include <fstream>
+#include <unordered_set>
 #include <vector>
 
 #include "iree/modules/io/parameters/module.h"
 #include "iree/runtime/api.h"
+#include "iree_allocator.h"
 #include "iree_compile.h"
 #include "iree_ep_factory.h"
 #include "iree_ort_utils.h"
@@ -92,6 +94,10 @@ iree_hal_device_t* IreeEp::IreeDevice() const {
 
 iree_runtime_instance_t* IreeEp::IreeInstance() const {
   return factory_.IreeInstance();
+}
+
+IreeAllocator* IreeEp::GetAllocator() const {
+  return factory_.GetAllocatorForDevice(device_id_);
 }
 
 /*static*/
@@ -387,17 +393,49 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
   IREE_ORT_RETURN_IF_ERROR(
       iree_runtime_call_invoke(call.Get(), IREE_RUNTIME_CALL_FLAG_RESERVED));
 
-  // Pop outputs and copy to ORT tensors.
+  // Pop outputs and transfer to ORT tensors.
   //
-  // TODO(perf): Currently IREE allocates its own output buffers, then we copy
-  // to ORT's pre-allocated device buffers (D2D copy). The way to properly
-  // eliminate this is by passing mutable dps buffers as part of the iree input
-  // signature and writing to them. The problem is that ORT doesn't give us a
-  // good way to infer the output shape. I'm not sure what the right fix is.
-  // Maybe we could have a custom iree allocator that does the job for us?
-  // I'm just not sure how to do this properly.
+  // Zero-copy output buffer reuse: Before calling ctx.GetOutput() (which
+  // triggers ORT to allocate the output tensor via IreeAllocator), we queue
+  // IREE's output buffer for reuse. When AllocImpl is called, it checks the
+  // thread-local reuse queue and returns IREE's existing buffer directly,
+  // eliminating the D2D copy entirely.
+  //
+  // Thread safety: The reuse queue is stack-local and registered as the
+  // thread-local active queue on the allocator. This ensures concurrent
+  // ComputeImpl calls on different threads never interfere with each other.
+  //
+  // Fallback: If buffer reuse fails (e.g., in-place IREE op, host output, or
+  // allocator not available), we fall back to the standard copy path.
   iree_vm_list_t* output_list = iree_runtime_call_outputs(call.Get());
   iree_host_size_t output_count = iree_vm_list_size(output_list);
+  IreeAllocator* iree_allocator = info->ep.GetAllocator();
+
+  // RAII scope guard for the reuse queue. Ensures the TLS pointer is cleared
+  // and retained buffers are released on ALL exit paths (including error
+  // returns from macros like IREE_ORT_RETURN_IF_ERROR / ORT_RETURN_IF_ERROR).
+  IreeAllocator::ReuseQueue reuse_queue;
+  struct ReuseQueueGuard {
+    IreeAllocator* allocator;
+    IreeAllocator::ReuseQueue& queue;
+    ReuseQueueGuard(IreeAllocator* a, IreeAllocator::ReuseQueue& q)
+        : allocator(a), queue(q) {
+      if (allocator) allocator->SetActiveReuseQueue(&queue);
+    }
+    ~ReuseQueueGuard() {
+      if (allocator) {
+        allocator->SetActiveReuseQueue(nullptr);
+        IreeAllocator::DrainReuseQueue(queue);
+      }
+    }
+    ReuseQueueGuard(const ReuseQueueGuard&) = delete;
+    ReuseQueueGuard& operator=(const ReuseQueueGuard&) = delete;
+  } reuse_guard(iree_allocator, reuse_queue);
+
+  // Track which underlying buffers we've already queued for reuse in this
+  // invocation. Multiple outputs may alias the same buffer (e.g., Identity
+  // fan-out), and queueing the same buffer twice corrupts the allocations map.
+  std::unordered_set<iree_hal_buffer_t*> reused_buffers;
 
   for (size_t i = 0; i < output_count; ++i) {
     // Pop output buffer view.
@@ -418,11 +456,39 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
           .release();
     }
 
-    // Allocate ORT output tensor and copy data from IREE buffer.
+    // Queue IREE's output buffer for reuse by the allocator.
+    // We retain the buffer to keep it alive — if reuse succeeds, the
+    // allocator takes ownership; if not, the guard drains the queue.
+    iree_hal_buffer_t* iree_buffer = iree_hal_buffer_view_buffer(output_view);
+    size_t byte_size =
+        static_cast<size_t>(iree_hal_buffer_view_byte_length(output_view));
+    bool try_reuse = iree_allocator && byte_size > 0 &&
+                     reused_buffers.find(iree_buffer) == reused_buffers.end();
+    if (try_reuse) {
+      // Drain any stale entry left by a previous GetOutput that didn't
+      // call our allocator (defensive resync).
+      IreeAllocator::DrainReuseQueue(reuse_queue);
+      iree_hal_buffer_retain(iree_buffer);
+      reuse_queue.push({iree_buffer, byte_size});
+    }
+
+    // Allocate ORT output tensor. If the allocator has a queued buffer,
+    // it returns IREE's buffer directly (zero-copy).
     Ort::UnownedValue output = ctx.GetOutput(i, shape.data(), shape.size());
-    ORT_RETURN_IF_ERROR(IreeBufferViewToOrtTensor(
-        output_view, output, device, info->ep.ep_api, info->ep.Logger()));
+
+    // Check if zero-copy succeeded by comparing buffer pointers.
+    void* ort_data = output.GetTensorMutableRawData();
+    if (try_reuse && ort_data == static_cast<void*>(iree_buffer)) {
+      // Zero-copy: ORT's tensor uses IREE's buffer directly.
+      reused_buffers.insert(iree_buffer);
+    } else {
+      // Fallback: Copy IREE buffer to ORT's allocated buffer.
+      ORT_RETURN_IF_ERROR(IreeBufferViewToOrtTensor(
+          output_view, output, device, info->ep.ep_api, info->ep.Logger()));
+    }
   }
+
+  // Guard destructor handles cleanup (clear TLS pointer + drain queue).
   return nullptr;
 }
 

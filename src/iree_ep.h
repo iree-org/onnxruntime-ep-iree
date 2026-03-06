@@ -25,6 +25,7 @@
 namespace onnxruntime::iree {
 
 // Forward declarations
+class IreeAllocator;
 class IreeEpFactory;
 
 // IREE Execution Provider.
@@ -60,6 +61,10 @@ class IreeEp : public OrtEp, public ApiPtrs {
   // Accessor for the IREE runtime instance (needed by IreeNodeComputeInfo for
   // lazy session creation).
   [[nodiscard]] iree_runtime_instance_t* IreeInstance() const;
+
+  // Returns the IREE allocator for this EP's device, or nullptr if not yet
+  // created. Used by ComputeImpl for zero-copy output buffer reuse.
+  [[nodiscard]] IreeAllocator* GetAllocator() const;
 
  private:
   // EP interface implementations (called via function pointers).
