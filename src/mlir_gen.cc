@@ -13,6 +13,7 @@
 #include "mlir_gen.h"
 
 #include <cassert>
+#include <charconv>
 #include <cstdint>
 #include <filesystem>
 #include <format>
@@ -191,18 +192,45 @@ std::string FormatMlirTensorType(const Ort::ConstTypeInfo& type_info) {
   return ss.str();
 }
 
+// Tries to parse an entire string as a non-negative integer.
+// Returns true and sets value on success. Returns false on any invalid input
+// (empty, non-digit characters, overflow). Uses std::from_chars — no
+// exceptions.
+bool ParseUnsigned(std::string_view s, size_t& value) {
+  if (s.empty()) return false;
+  size_t parsed{};
+  auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), parsed);
+  if (ec != std::errc{} || ptr != s.data() + s.size()) return false;
+  value = parsed;
+  return true;
+}
+
+// Parses an input reference of the form "$N" where N is a non-negative integer.
+// Returns true and sets input_idx = N. Returns false for literal values
+// (e.g., "4") or malformed specs (e.g., "$abc", "$").
+bool ParseInputRef(const std::string& spec, size_t& input_idx) {
+  if (spec.size() < 2 || spec[0] != '$') return false;
+  return ParseUnsigned(std::string_view(spec).substr(1), input_idx);
+}
+
 // MLIR generator class.
 class MlirGenerator {
  public:
   MlirGenerator(const Ort::ConstGraph& graph, std::ostream& out,
-                const std::string& irpa_path)
-      : graph_(graph), out_(out), irpa_path_(irpa_path) {}
+                const std::string& irpa_path, TargetConfig target_config)
+      : graph_(graph),
+        out_(out),
+        irpa_path_(irpa_path),
+        target_config_(std::move(target_config)) {}
 
-  void Generate() {
+  OrtStatus* Generate() {
     CollectMetadata();
-    EmitModuleHeader();
-    EmitFunctionBody();
+    OrtStatus* status = EmitModuleHeader();
+    if (status) return status;
+    status = EmitFunctionBody();
+    if (status) return status;
     EmitModuleFooter();
+    return nullptr;
   }
 
   // Builds an IRPA parameter archive for large initializers and creates a
@@ -256,7 +284,7 @@ class MlirGenerator {
     initializers_ = initializers;
   }
 
-  void EmitModuleHeader() {
+  OrtStatus* EmitModuleHeader() {
     // Build function arguments.
     std::ostringstream args;
     for (size_t i = 0; i < graph_inputs_.size(); ++i) {
@@ -277,8 +305,21 @@ class MlirGenerator {
       ret_types << FormatTensorType(graph_outputs_[i].TypeInfo());
     }
 
-    constexpr std::string_view schema = R"(module {{
-  func.func @{0}({1}) -> ({2})
+    // Define the #executable_target alias for hal.dispatch.extern objects()
+    // clauses. This is harmless when no extern dispatches are present.
+    // We intentionally do NOT set hal.device.targets on the module — device
+    // targeting is handled by iree-compile CLI flags (--iree-hal-target-device,
+    // --iree-hip-target, etc.).
+    if (!target_config_.hal_backend.empty()) {
+      out_ << "#executable_target = #hal.executable.target<\""
+           << target_config_.hal_backend << "\", \""
+           << target_config_.hal_format << "\", {target_arch = \""
+           << target_config_.target_arch << "\"}>\n";
+    }
+    out_ << "module {\n";
+
+    constexpr std::string_view func_schema =
+        R"(  func.func @{0}({1}) -> ({2})
       attributes {{
         torch.onnx_meta.ir_version = {3} : si64,
         torch.onnx_meta.opset_version = {4} : si64,
@@ -287,15 +328,16 @@ class MlirGenerator {
       }} {{
 )";
 
-    out_ << std::format(schema,
+    out_ << std::format(func_schema,
                         graph_name_,      // {0}
                         args.str(),       // {1}
                         ret_types.str(),  // {2}
                         ir_version_,      // {3}
                         opset_version_);  // {4}
+    return nullptr;
   }
 
-  void EmitFunctionBody() {
+  OrtStatus* EmitFunctionBody() {
     // Emit initializers as flow.tensor.constant ops.
     for (size_t i = 0; i < initializers_.size(); ++i) {
       EmitInitializer(initializers_[i], i);
@@ -304,11 +346,13 @@ class MlirGenerator {
     // Emit nodes.
     auto nodes = graph_.GetNodes();
     for (const auto& node : nodes) {
-      EmitNode(node);
+      OrtStatus* status = EmitNode(node);
+      if (status) return status;
     }
 
     // Emit return.
     EmitReturn();
+    return nullptr;
   }
 
   // Emits an initializer as a flow.tensor.constant with a
@@ -362,7 +406,12 @@ class MlirGenerator {
     }
   }
 
-  void EmitNode(const Ort::ConstNode& node) {
+  OrtStatus* EmitNode(const Ort::ConstNode& node) {
+    if (node.GetDomain() == "com.iree" &&
+        node.GetOperatorType() == "ExternDispatch") {
+      return EmitExternDispatch(node, extern_id_++);
+    }
+
     std::string op_type = node.GetOperatorType();
     auto inputs = node.GetInputs();
     auto outputs = node.GetOutputs();
@@ -435,6 +484,7 @@ class MlirGenerator {
                         attr_str,         // {3}
                         in_types.str(),   // {4}
                         out_types_str);   // {5}
+    return nullptr;
   }
 
   std::string FormatAttributes(const std::vector<Ort::ConstOpAttr>& attrs) {
@@ -486,6 +536,328 @@ class MlirGenerator {
     }
   }
 
+  // Emits ops to resolve a spec string to an SSA value. The spec is either:
+  // - A literal integer (emits arith.constant)
+  // - "$N" input reference (extracts scalar from input tensor N)
+  // as_i32: if true, result is i32; otherwise index.
+  // context: used in error messages, e.g. "push_constants[0]".
+  OrtStatus* EmitResolvedValue(
+      const std::string& spec, const std::string& result_name, bool as_i32,
+      const std::vector<std::string>& raw_input_names,
+      const std::vector<std::string>& raw_input_types,
+      const std::vector<std::string>& raw_input_elem_types,
+      const std::vector<size_t>& raw_input_ranks, const std::string& context) {
+    size_t input_idx;
+    if (ParseInputRef(spec, input_idx)) {
+      if (input_idx >= raw_input_names.size()) {
+        return MakeError(
+            "ExternDispatch: {} = '{}' references input[{}] but only {} "
+            "inputs available",
+            context, spec, input_idx, raw_input_names.size());
+      }
+      if (raw_input_names[input_idx].empty()) {
+        return MakeError(
+            "ExternDispatch: {} = '{}' references input[{}] which is "
+            "null or empty",
+            context, spec, input_idx);
+      }
+      if (raw_input_ranks[input_idx] != 0) {
+        return MakeError(
+            "ExternDispatch: {} = '{}' references input[{}] which has "
+            "rank {} (must be a scalar tensor, rank 0)",
+            context, spec, input_idx, raw_input_ranks[input_idx]);
+      }
+      const std::string& elem_type = raw_input_elem_types[input_idx];
+      if (elem_type != "i64" && elem_type != "i32") {
+        return MakeError(
+            "ExternDispatch: {} = '{}' references input[{}] with element "
+            "type {} (must be i32 or i64)",
+            context, spec, input_idx, elem_type);
+      }
+      // Extract scalar from the rank-0 tensor.
+      if (as_i32 && elem_type == "i32") {
+        // Already i32 — extract directly into result, no cast needed.
+        out_ << std::format("    %{} = tensor.extract %{}[] : {}\n",
+                            result_name, raw_input_names[input_idx],
+                            raw_input_types[input_idx]);
+      } else {
+        std::string scalar = result_name + "_scalar";
+        out_ << std::format("    %{} = tensor.extract %{}[] : {}\n", scalar,
+                            raw_input_names[input_idx],
+                            raw_input_types[input_idx]);
+        // Cast to the target type.
+        if (as_i32) {
+          // elem_type is i64 here (i32 case handled above).
+          out_ << std::format("    %{} = arith.trunci %{} : i64 to i32\n",
+                              result_name, scalar);
+        } else {
+          out_ << std::format("    %{} = arith.index_cast %{} : {} to index\n",
+                              result_name, scalar, elem_type);
+        }
+      }
+    } else {
+      size_t value;
+      if (!ParseUnsigned(spec, value)) {
+        return MakeError(
+            "ExternDispatch: {} = '{}' is not a valid integer literal "
+            "or input reference ($N)",
+            context, spec);
+      }
+      if (as_i32 && value > static_cast<size_t>(INT32_MAX)) {
+        return MakeError("ExternDispatch: {} = '{}' exceeds i32 range (max {})",
+                         context, spec, INT32_MAX);
+      }
+      out_ << std::format("    %{} = arith.constant {} : {}\n", result_name,
+                          spec, as_i32 ? "i32" : "index");
+    }
+    return nullptr;
+  }
+
+  // Emits a hal.dispatch.extern for a com.iree:ExternDispatch ONNX node.
+  OrtStatus* EmitExternDispatch(const Ort::ConstNode& node, int extern_id) {
+    std::string prefix = std::format("__extern_{}", extern_id);
+    auto inputs = node.GetInputs();
+    auto outputs = node.GetOutputs();
+
+    // Parse ExternDispatch attributes.
+    std::string kernel_name;
+    std::string kernel_object;
+    std::vector<int64_t> workgroup_size;
+    std::vector<std::string> push_constants;
+    std::vector<std::string> workgroup_count;
+
+    for (const auto& attr : node.GetAttributes()) {
+      std::string name = attr.GetName();
+      if (name == "kernel_name") {
+        attr.GetValue(kernel_name);
+      } else if (name == "kernel_object") {
+        attr.GetValue(kernel_object);
+      } else if (name == "workgroup_size") {
+        attr.GetValueArray<int64_t>(workgroup_size);
+      } else if (name == "push_constants") {
+        attr.GetValueArray<std::string>(push_constants);
+      } else if (name == "workgroup_count") {
+        attr.GetValueArray<std::string>(workgroup_count);
+      }
+    }
+
+    // Validate backend supports extern dispatch (must have a HAL target).
+    if (target_config_.hal_backend.empty()) {
+      return MakeError(
+          "ExternDispatch: backend '{}' does not support extern dispatch",
+          target_config_.backend);
+    }
+
+    // Validate required attributes.
+    if (kernel_name.empty()) {
+      return MakeError(
+          "ExternDispatch: missing required 'kernel_name' attribute");
+    }
+    if (kernel_object.empty()) {
+      return MakeError(
+          "ExternDispatch: missing required 'kernel_object' attribute");
+    }
+    if (workgroup_size.size() != 3) {
+      return MakeError(
+          "ExternDispatch: 'workgroup_size' must have exactly 3 elements "
+          "(X, Y, Z), got {}",
+          workgroup_size.size());
+    }
+    for (size_t i = 0; i < 3; ++i) {
+      if (workgroup_size[i] <= 0) {
+        return MakeError(
+            "ExternDispatch: workgroup_size[{}] = {} must be positive", i,
+            workgroup_size[i]);
+      }
+    }
+    if (workgroup_count.size() != 3) {
+      return MakeError(
+          "ExternDispatch: 'workgroup_count' must have "
+          "exactly 3 elements (X, Y, Z), got {}",
+          workgroup_count.size());
+    }
+
+    // Pre-scan push_constants and workgroup_count for $N input references.
+    // Inputs referenced by $N are scalar tensors consumed as values, NOT
+    // data buffers — they must be excluded from dispatch args and bindings.
+    std::unordered_set<size_t> scalar_input_indices;
+    for (const auto& spec : push_constants) {
+      size_t idx;
+      if (ParseInputRef(spec, idx)) scalar_input_indices.insert(idx);
+    }
+    for (const auto& spec : workgroup_count) {
+      size_t idx;
+      if (ParseInputRef(spec, idx)) scalar_input_indices.insert(idx);
+    }
+
+    // Step 1: Bridge ALL inputs from torch to builtin tensor.
+    // Vectors are indexed by original ONNX input position so that $N input
+    // refs resolve correctly. Scalar inputs (referenced by $N) are bridged
+    // too — they need builtin tensors for tensor.extract.
+    std::vector<std::string> raw_input_names(inputs.size());
+    std::vector<std::string> raw_input_types(inputs.size());
+    std::vector<std::string> raw_input_elem_types(inputs.size());
+    std::vector<size_t> raw_input_ranks(inputs.size(), 0);
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      if (!inputs[i]) continue;
+      std::string input_name = inputs[i].GetName();
+      if (input_name.empty()) continue;
+
+      std::string ssa = SanitizeName(input_name);
+      std::string vtensor_type = FormatTensorType(inputs[i].TypeInfo());
+      std::string tensor_type = FormatMlirTensorType(inputs[i].TypeInfo());
+      auto tensor_info = inputs[i].TypeInfo().GetTensorTypeAndShapeInfo();
+      std::string raw = std::format("{}_raw_{}", prefix, i);
+      raw_input_names[i] = raw;
+      raw_input_types[i] = tensor_type;
+      raw_input_elem_types[i] =
+          GetElementType(tensor_info.GetElementType(), /*signless=*/true);
+      raw_input_ranks[i] = tensor_info.GetShape().size();
+
+      out_ << std::format(
+          "    %{} = torch_c.to_builtin_tensor %{} : {} -> {}\n", raw, ssa,
+          vtensor_type, tensor_type);
+    }
+
+    // Step 2: Emit push constants.
+    std::vector<std::string> pc_names;
+    for (size_t i = 0; i < push_constants.size(); ++i) {
+      std::string pc = std::format("{}_pc{}", prefix, i);
+      pc_names.push_back(pc);
+      OrtStatus* status = EmitResolvedValue(
+          push_constants[i], pc, /*as_i32=*/true, raw_input_names,
+          raw_input_types, raw_input_elem_types, raw_input_ranks,
+          std::format("push_constants[{}]", i));
+      if (status) return status;
+    }
+
+    // Step 3: Compute workload values from workgroup_count[0..2].
+    // All three dimensions are resolved (literal or $N input reference) and
+    // passed as workload arguments to hal.dispatch.extern. The count region
+    // receives them as block arguments and returns them directly.
+    std::vector<std::string> workload_names;
+    for (size_t i = 0; i < 3; ++i) {
+      std::string wl = std::format("{}_workload_{}", prefix, i);
+      workload_names.push_back(wl);
+      OrtStatus* status = EmitResolvedValue(
+          workgroup_count[i], wl, /*as_i32=*/false, raw_input_names,
+          raw_input_types, raw_input_elem_types, raw_input_ranks,
+          std::format("workgroup_count[{}]", i));
+      if (status) return status;
+    }
+
+    // Step 4: Build output names and types.
+    // ExternDispatch is opaque — ORT cannot infer its output shapes. The ONNX
+    // model must declare explicit type info for all ExternDispatch outputs
+    // (via graph value_info entries).
+    std::vector<std::string> out_raw_names;
+    std::vector<std::string> out_raw_types;
+    std::vector<std::string> out_vtensor_types;
+    std::vector<std::string> out_ssa_names;
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      if (!outputs[i]) continue;
+      std::string output_name = outputs[i].GetName();
+      if (output_name.empty()) continue;
+      out_raw_names.push_back(std::format("{}_out{}", prefix, i));
+      out_raw_types.push_back(FormatMlirTensorType(outputs[i].TypeInfo()));
+      out_vtensor_types.push_back(FormatTensorType(outputs[i].TypeInfo()));
+      out_ssa_names.push_back(SanitizeName(output_name));
+    }
+
+    if (out_raw_names.empty()) {
+      return MakeError(
+          "ExternDispatch: node has no valid outputs (all outputs are "
+          "null or have empty names)");
+    }
+
+    // Step 5: Emit hal.dispatch.extern.
+    // Pre-build variable parts for the dispatch template.
+    std::vector<std::string> dispatch_outs;
+    for (const auto& name : out_raw_names) {
+      dispatch_outs.push_back("%" + name);
+    }
+
+    std::vector<std::string> dispatch_args;
+    for (const auto& pc : pc_names) {
+      dispatch_args.push_back("%" + pc);
+    }
+    for (size_t i = 0; i < raw_input_names.size(); ++i) {
+      if (!raw_input_names[i].empty() && !scalar_input_indices.count(i)) {
+        dispatch_args.push_back("%" + raw_input_names[i]);
+      }
+    }
+
+    std::vector<std::string> dispatch_arg_types;
+    for (size_t i = 0; i < pc_names.size(); ++i) {
+      dispatch_arg_types.push_back("i32");
+    }
+    for (size_t i = 0; i < raw_input_types.size(); ++i) {
+      if (!raw_input_types[i].empty() && !scalar_input_indices.count(i)) {
+        dispatch_arg_types.push_back(raw_input_types[i]);
+      }
+    }
+
+    std::string ret_types_str;
+    if (out_raw_types.size() == 1) {
+      ret_types_str = out_raw_types[0];
+    } else {
+      ret_types_str = "(" + Join(out_raw_types, ", ") + ")";
+    }
+
+    std::vector<std::string> bindings;
+    for (size_t i = 0; i < raw_input_names.size(); ++i) {
+      if (!raw_input_names[i].empty() && !scalar_input_indices.count(i)) {
+        bindings.push_back(
+            "        #hal.pipeline.binding<storage_buffer, ReadOnly>");
+      }
+    }
+    for (size_t i = 0; i < out_raw_names.size(); ++i) {
+      bindings.push_back("        #hal.pipeline.binding<storage_buffer>");
+    }
+
+    std::vector<std::string> wg_size_parts;
+    for (auto s : workgroup_size) {
+      wg_size_parts.push_back(std::format("{} : index", s));
+    }
+
+    constexpr std::string_view dispatch_schema =
+        R"(    {0} = hal.dispatch.extern "{1}"[%{2}, %{3}, %{4}]({5})
+        : ({6}) -> {7}
+      count(%device: !hal.device, %wl_x: index, %wl_y: index, %wl_z: index) -> (index, index, index) {{
+        hal.return %wl_x, %wl_y, %wl_z : index, index, index
+      }}
+      layout(#hal.pipeline.layout<constants = {8}, bindings = [
+{9}      ]>)
+      objects({{
+        #executable_target ordinal(0) = [
+          #hal.executable.object<{{path = "{10}"}}>
+        ]
+      }})
+      attributes {{workgroup_size = [{11}]}}
+)";
+    out_ << std::format(dispatch_schema, Join(dispatch_outs, ", "),  // {0}
+                        kernel_name,                                 // {1}
+                        workload_names[0],                           // {2}
+                        workload_names[1],                           // {3}
+                        workload_names[2],                           // {4}
+                        Join(dispatch_args, ", "),                   // {5}
+                        Join(dispatch_arg_types, ", "),              // {6}
+                        ret_types_str,                               // {7}
+                        pc_names.size(),                             // {8}
+                        Join(bindings, ",\n") + "\n",                // {9}
+                        kernel_object,                               // {10}
+                        Join(wg_size_parts, ", "));                  // {11}
+
+    // Step 6: Bridge outputs back to torch types.
+    for (size_t i = 0; i < out_raw_names.size(); ++i) {
+      out_ << std::format(
+          "    %{} = torch_c.from_builtin_tensor %{} : {} -> {}\n",
+          out_ssa_names[i], out_raw_names[i], out_raw_types[i],
+          out_vtensor_types[i]);
+    }
+    return nullptr;
+  }
+
   void EmitReturn() {
     std::ostringstream ret_values;
     std::ostringstream ret_types;
@@ -511,6 +883,7 @@ class MlirGenerator {
   const Ort::ConstGraph& graph_;
   std::ostream& out_;
   std::string irpa_path_;
+  TargetConfig target_config_;
 
   std::string graph_name_;
   int64_t ir_version_ = 8;
@@ -520,6 +893,9 @@ class MlirGenerator {
   std::vector<Ort::ConstValueInfo> graph_outputs_;
   std::vector<Ort::ConstValueInfo> initializers_;
   std::vector<ParameterInitializer> parameter_initializers_;
+
+  // Extern dispatch state.
+  int extern_id_ = 0;
 };
 
 // Builds an IRPA parameter archive for large initializers.
@@ -565,11 +941,7 @@ OrtStatus* MlirGenerator::BuildParameterArchive(
     Ort::ConstValue tensor(nullptr);
     auto status = init.GetInitializer(tensor);
     if (!status.IsOK()) {
-      return Ort::Status(
-                 std::format("Failed to get initializer: {}", init.GetName())
-                     .c_str(),
-                 ORT_FAIL)
-          .release();
+      return MakeError("Failed to get initializer: {}", init.GetName());
     }
 
     auto* data = const_cast<uint8_t*>(
@@ -652,28 +1024,43 @@ OrtStatus* MlirGenerator::BuildParameterArchive(
 
 }  // namespace
 
+/*static*/
+TargetConfig TargetConfig::Create(const std::string& target_arch,
+                                  const std::string& backend) {
+  TargetConfig config;
+  config.target_arch = target_arch;
+  config.backend = backend;
+  if (backend == "hip") {
+    config.hal_backend = "rocm";
+    config.hal_format = "rocm-hsaco-fb";
+  } else if (backend == "cuda") {
+    config.hal_backend = "cuda";
+    config.hal_format = "cuda-nvptx-fb";
+  } else if (backend == "vulkan") {
+    config.hal_backend = "vulkan-spirv";
+    config.hal_format = "vulkan-spirv-fb";
+  }
+  return config;
+}
+
 OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& /*ort_api*/,
                         const std::string& mlir_path,
                         const std::string& irpa_path,
                         ParameterIndexPtr& out_index,
-                        ParameterProviderPtr& out_provider) {
+                        ParameterProviderPtr& out_provider,
+                        TargetConfig target_config) {
   std::ofstream file(mlir_path);
   if (!file.is_open()) {
-    return Ort::Status(
-               std::format("Failed to open output file: {}", mlir_path).c_str(),
-               ORT_FAIL)
-        .release();
+    return MakeError("Failed to open output file: {}", mlir_path);
   }
 
-  MlirGenerator gen(graph, file, irpa_path);
-  gen.Generate();
+  MlirGenerator gen(graph, file, irpa_path, std::move(target_config));
+  OrtStatus* gen_status = gen.Generate();
+  if (gen_status) return gen_status;
 
   file.close();
   if (file.fail()) {
-    return Ort::Status(
-               std::format("Failed to write to file: {}", mlir_path).c_str(),
-               ORT_FAIL)
-        .release();
+    return MakeError("Failed to write to file: {}", mlir_path);
   }
 
   return gen.BuildParameterArchive(out_index, out_provider);

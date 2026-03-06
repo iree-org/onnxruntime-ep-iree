@@ -44,6 +44,9 @@ class IreeEp : public OrtEp, public ApiPtrs {
     std::string backend = "";
     // Save intermediate compilation artifacts (MLIR, VMFB) for debugging.
     bool save_intermediates = false;
+    // Path to directory containing pre-compiled kernel objects (.co files).
+    // When non-empty, enables extern dispatch support.
+    std::string extern_kernel_path = "";
   };
 
   IreeEp(IreeEpFactory& factory, const std::string& name, const Config& config,

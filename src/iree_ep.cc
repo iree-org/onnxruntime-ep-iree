@@ -53,6 +53,12 @@ static std::vector<std::string> GenerateCompileFlags(
     assert(false && "Unsupported backend, should have been caught earlier");
   }
 
+  // Extern dispatch support: add search path for pre-compiled kernel objects.
+  if (!config.extern_kernel_path.empty()) {
+    flags.push_back("--iree-hal-executable-object-search-path=" +
+                    config.extern_kernel_path);
+  }
+
   flags.push_back("--iree-opt-level=" + config.opt_level);
   return flags;
 }
@@ -192,11 +198,15 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
   Ort::ConstGraph graph{graphs[0]};
   ParameterIndexPtr parameter_index;
   ParameterProviderPtr parameter_provider;
+
+  TargetConfig target_config =
+      TargetConfig::Create(ep->config_.target_arch, ep->config_.backend);
+
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: Generating MLIR");
-  ORT_RETURN_IF_ERROR(GenerateMlir(graph, ep->ort_api, mlir_file.Path(),
-                                   irpa_file.Path(), parameter_index,
-                                   parameter_provider));
+  ORT_RETURN_IF_ERROR(GenerateMlir(
+      graph, ep->ort_api, mlir_file.Path(), irpa_file.Path(), parameter_index,
+      parameter_provider, std::move(target_config)));
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: MLIR Generated Successfully");
 

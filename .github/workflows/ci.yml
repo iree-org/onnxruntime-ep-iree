@@ -40,3 +40,9 @@ jobs:
 
       - name: Run tests
         run: pytest test/ -v
+
+      - name: Run ExternDispatch tests
+        run: |
+          pytest test/test_extern_dispatch.py \
+            --ep-lib ${{ github.workspace }}/${BUILD_DIR}/libonnxruntime_ep_iree.so \
+            -v

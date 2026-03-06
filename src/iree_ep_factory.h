@@ -114,6 +114,13 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
       const OrtKeyValuePairs* stream_options,
       OrtSyncStreamImpl** stream) noexcept;
 
+  // Custom op domain support for com.iree:ExternDispatch.
+  static OrtStatus* ORT_API_CALL GetNumCustomOpDomainsImpl(
+      OrtEpFactory* this_ptr, size_t* num_domains) noexcept;
+  static OrtStatus* ORT_API_CALL
+  GetCustomOpDomainsImpl(OrtEpFactory* this_ptr, OrtCustomOpDomain** domains,
+                         size_t num_domains) noexcept;
+
   // Enumerate IREE devices and create OrtHardwareDevice instances.
   void CreateIreeHwDevices();
 
@@ -145,6 +152,10 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
 
   // Shared data transfer instance. Created lazily when requested.
   std::unique_ptr<IreeDataTransfer> data_transfer_;
+
+  // Custom op domain for com.iree:ExternDispatch nodes.
+  // Must outlive all sessions using it.
+  Ort::CustomOpDomain extern_dispatch_domain_{nullptr};
 };
 
 }  // namespace onnxruntime::iree
