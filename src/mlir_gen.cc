@@ -105,8 +105,8 @@ std::string Join(const std::vector<std::string>& parts,
 // Returns MLIR element type string for an ONNX tensor element type.
 // If signless is true, returns signless types (i64) for all integers.
 // Otherwise returns signed (si64) or unsigned (ui64) types for torch dialect.
-std::string GetElementType(ONNXTensorElementDataType dtype,
-                           bool signless = false) {
+ErrorOr<std::string> GetElementType(ONNXTensorElementDataType dtype,
+                                    bool signless = false) {
   switch (dtype) {
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
       return "f32";
@@ -135,14 +135,15 @@ std::string GetElementType(ONNXTensorElementDataType dtype,
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
       return "i1";
     default:
-      return "NYI";
+      return error("Unsupported element type: {}", static_cast<int>(dtype));
   }
 }
 
 // Formats a tensor type as !torch.vtensor<[dims],dtype>.
-std::string FormatTensorType(const Ort::ConstTypeInfo& type_info) {
+ErrorOr<std::string> FormatTensorType(const Ort::ConstTypeInfo& type_info) {
   if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
-    return "NYI";  // NYI: non-tensor types.
+    return error("Non-tensor type {} not supported",
+                 static_cast<int>(type_info.GetONNXType()));
   }
 
   auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
@@ -163,15 +164,17 @@ std::string FormatTensorType(const Ort::ConstTypeInfo& type_info) {
       ss << shape[i];
     }
   }
-  ss << "]," << GetElementType(dtype) << ">";
+  IREE_EP_ASSIGN_OR_RETURN(std::string elem_type, GetElementType(dtype));
+  ss << "]," << elem_type << ">";
   return ss.str();
 }
 
 // Formats a tensor type as tensor<dimsxdtype> (standard MLIR format).
 // Uses signless integer types as required by MLIR tensor dialect.
-std::string FormatMlirTensorType(const Ort::ConstTypeInfo& type_info) {
+ErrorOr<std::string> FormatMlirTensorType(const Ort::ConstTypeInfo& type_info) {
   if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
-    return "NYI";
+    return error("Non-tensor type {} not supported",
+                 static_cast<int>(type_info.GetONNXType()));
   }
 
   auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
@@ -188,7 +191,9 @@ std::string FormatMlirTensorType(const Ort::ConstTypeInfo& type_info) {
     }
     ss << "x";
   }
-  ss << GetElementType(dtype, /*signless=*/true) << ">";
+  IREE_EP_ASSIGN_OR_RETURN(std::string elem_type,
+                           GetElementType(dtype, /*signless=*/true));
+  ss << elem_type << ">";
   return ss.str();
 }
 
@@ -292,7 +297,8 @@ class MlirGenerator {
         args << ", ";
       }
       std::string name = SanitizeName(graph_inputs_[i].GetName());
-      std::string type = FormatTensorType(graph_inputs_[i].TypeInfo());
+      IREE_ORT_ASSIGN_OR_RETURN(std::string type,
+                                FormatTensorType(graph_inputs_[i].TypeInfo()));
       args << "%" << name << ": " << type;
     }
 
@@ -302,7 +308,9 @@ class MlirGenerator {
       if (i > 0) {
         ret_types << ", ";
       }
-      ret_types << FormatTensorType(graph_outputs_[i].TypeInfo());
+      IREE_ORT_ASSIGN_OR_RETURN(std::string ret_type,
+                                FormatTensorType(graph_outputs_[i].TypeInfo()));
+      ret_types << ret_type;
     }
 
     // Define the #executable_target alias for hal.dispatch.extern objects()
@@ -340,7 +348,8 @@ class MlirGenerator {
   OrtStatus* EmitFunctionBody() {
     // Emit initializers as flow.tensor.constant ops.
     for (size_t i = 0; i < initializers_.size(); ++i) {
-      EmitInitializer(initializers_[i], i);
+      OrtStatus* status = EmitInitializer(initializers_[i], i);
+      if (status) return status;
     }
 
     // Emit nodes.
@@ -351,8 +360,7 @@ class MlirGenerator {
     }
 
     // Emit return.
-    EmitReturn();
-    return nullptr;
+    return EmitReturn();
   }
 
   // Emits an initializer as a flow.tensor.constant with a
@@ -370,10 +378,13 @@ class MlirGenerator {
   //       #flow.parameter.named<"model"::"name"> : tensor<...>
   //   %name = torch_c.from_builtin_tensor %__raw_name : tensor<...>
   //       -> !torch.vtensor<[...],dtype>
-  void EmitInitializer(const Ort::ConstValueInfo& init, size_t init_index) {
+  OrtStatus* EmitInitializer(const Ort::ConstValueInfo& init,
+                             size_t init_index) {
     std::string name = SanitizeName(init.GetName());
-    std::string vtensor_type = FormatTensorType(init.TypeInfo());
-    std::string tensor_type = FormatMlirTensorType(init.TypeInfo());
+    IREE_ORT_ASSIGN_OR_RETURN(std::string vtensor_type,
+                              FormatTensorType(init.TypeInfo()));
+    IREE_ORT_ASSIGN_OR_RETURN(std::string tensor_type,
+                              FormatMlirTensorType(init.TypeInfo()));
 
     auto tensor_info = init.TypeInfo().GetTensorTypeAndShapeInfo();
     size_t byte_size = tensor_info.GetElementCount() *
@@ -384,7 +395,7 @@ class MlirGenerator {
       Ort::ConstValue tensor_value{nullptr};
       auto status = init.GetInitializer(tensor_value);
       if (!status.IsOK()) {
-        return;
+        return status.release();
       }
       const auto* data =
           static_cast<const uint8_t*>(tensor_value.GetTensorRawData());
@@ -404,6 +415,7 @@ class MlirGenerator {
       out_ << std::format(schema, name, tensor_type, vtensor_type);
       parameter_initializers_.push_back({name, init_index});
     }
+    return nullptr;
   }
 
   OrtStatus* EmitNode(const Ort::ConstNode& node) {
@@ -439,7 +451,9 @@ class MlirGenerator {
       first_output = false;
       valid_output_count++;
       out_names << "%" << SanitizeName(output_name);
-      out_types << FormatTensorType(outputs[i].TypeInfo());
+      IREE_ORT_ASSIGN_OR_RETURN(std::string out_type,
+                                FormatTensorType(outputs[i].TypeInfo()));
+      out_types << out_type;
     }
 
     // Build input SSA references.
@@ -461,11 +475,13 @@ class MlirGenerator {
       }
       first_input = false;
       in_names << "%" << SanitizeName(input_name);
-      in_types << FormatTensorType(inputs[i].TypeInfo());
+      IREE_ORT_ASSIGN_OR_RETURN(std::string in_type,
+                                FormatTensorType(inputs[i].TypeInfo()));
+      in_types << in_type;
     }
 
     // Build attributes.
-    std::string attr_str = FormatAttributes(attrs);
+    IREE_ORT_ASSIGN_OR_RETURN(std::string attr_str, FormatAttributes(attrs));
 
     // Format output types: wrap in parentheses if multiple outputs.
     std::string out_types_str = out_types.str();
@@ -487,7 +503,8 @@ class MlirGenerator {
     return nullptr;
   }
 
-  std::string FormatAttributes(const std::vector<Ort::ConstOpAttr>& attrs) {
+  ErrorOr<std::string> FormatAttributes(
+      const std::vector<Ort::ConstOpAttr>& attrs) {
     if (attrs.empty()) {
       return "";
     }
@@ -497,12 +514,14 @@ class MlirGenerator {
       if (i > 0) {
         ss << ", ";
       }
-      ss << FormatAttribute(attrs[i]);
+      IREE_EP_ASSIGN_OR_RETURN(std::string formatted,
+                               FormatAttribute(attrs[i]));
+      ss << formatted;
     }
     return ss.str();
   }
 
-  std::string FormatAttribute(const Ort::ConstOpAttr& attr) {
+  ErrorOr<std::string> FormatAttribute(const Ort::ConstOpAttr& attr) {
     std::string name = attr.GetName();
     OrtOpAttrType type = attr.GetType();
 
@@ -532,7 +551,8 @@ class MlirGenerator {
                            Join(str_values, ", "));
       }
       default:
-        return std::format("torch.onnx.{0} = \"NYI\"", name);
+        return error("Unsupported attribute type {} for '{}'",
+                     static_cast<int>(type), name);
     }
   }
 
@@ -704,14 +724,17 @@ class MlirGenerator {
       if (input_name.empty()) continue;
 
       std::string ssa = SanitizeName(input_name);
-      std::string vtensor_type = FormatTensorType(inputs[i].TypeInfo());
-      std::string tensor_type = FormatMlirTensorType(inputs[i].TypeInfo());
+      IREE_ORT_ASSIGN_OR_RETURN(std::string vtensor_type,
+                                FormatTensorType(inputs[i].TypeInfo()));
+      IREE_ORT_ASSIGN_OR_RETURN(std::string tensor_type,
+                                FormatMlirTensorType(inputs[i].TypeInfo()));
       auto tensor_info = inputs[i].TypeInfo().GetTensorTypeAndShapeInfo();
       std::string raw = std::format("{}_raw_{}", prefix, i);
       raw_input_names[i] = raw;
       raw_input_types[i] = tensor_type;
-      raw_input_elem_types[i] =
-          GetElementType(tensor_info.GetElementType(), /*signless=*/true);
+      IREE_ORT_ASSIGN_OR_RETURN(
+          raw_input_elem_types[i],
+          GetElementType(tensor_info.GetElementType(), /*signless=*/true));
       raw_input_ranks[i] = tensor_info.GetShape().size();
 
       out_ << std::format(
@@ -759,8 +782,12 @@ class MlirGenerator {
       std::string output_name = outputs[i].GetName();
       if (output_name.empty()) continue;
       out_raw_names.push_back(std::format("{}_out{}", prefix, i));
-      out_raw_types.push_back(FormatMlirTensorType(outputs[i].TypeInfo()));
-      out_vtensor_types.push_back(FormatTensorType(outputs[i].TypeInfo()));
+      IREE_ORT_ASSIGN_OR_RETURN(std::string raw_type,
+                                FormatMlirTensorType(outputs[i].TypeInfo()));
+      out_raw_types.push_back(std::move(raw_type));
+      IREE_ORT_ASSIGN_OR_RETURN(std::string vtensor_type,
+                                FormatTensorType(outputs[i].TypeInfo()));
+      out_vtensor_types.push_back(std::move(vtensor_type));
       out_ssa_names.push_back(SanitizeName(output_name));
     }
 
@@ -858,7 +885,7 @@ class MlirGenerator {
     return nullptr;
   }
 
-  void EmitReturn() {
+  OrtStatus* EmitReturn() {
     std::ostringstream ret_values;
     std::ostringstream ret_types;
     for (size_t i = 0; i < graph_outputs_.size(); ++i) {
@@ -867,11 +894,14 @@ class MlirGenerator {
         ret_types << ", ";
       }
       ret_values << "%" << SanitizeName(graph_outputs_[i].GetName());
-      ret_types << FormatTensorType(graph_outputs_[i].TypeInfo());
+      IREE_ORT_ASSIGN_OR_RETURN(std::string ret_type,
+                                FormatTensorType(graph_outputs_[i].TypeInfo()));
+      ret_types << ret_type;
     }
 
     out_ << std::format("    return {0} : {1}\n", ret_values.str(),
                         ret_types.str());
+    return nullptr;
   }
 
   void EmitModuleFooter() {

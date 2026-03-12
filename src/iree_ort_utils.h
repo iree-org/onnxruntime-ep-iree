@@ -20,6 +20,7 @@
 #include "iree/hal/api.h"
 #include "iree_wrappers.h"
 #include "ort_import.h"
+#include "support.h"
 
 namespace onnxruntime::iree {
 
@@ -35,6 +36,20 @@ OrtStatus* MakeError(std::format_string<Args...> fmt, Args&&... args) {
                      ORT_FAIL)
       .release();
 }
+
+#define IREE_ORT_ASSIGN_OR_RETURN_IMPL(tmp, varDecl, expr)          \
+  auto tmp = (expr);                                                \
+  if (isError(tmp)) return MakeError("{}", tmp.getError().message); \
+  varDecl = std::move(*tmp)
+
+// Evaluates `expr` (which must return ErrorOr<T>), propagates the error as
+// OrtStatus* if in error state, otherwise binds the value to `varDecl`.
+//
+// Usage (in a function returning OrtStatus*):
+//   IREE_ORT_ASSIGN_OR_RETURN(std::string s, FormatAttribute(attr));
+#define IREE_ORT_ASSIGN_OR_RETURN(varDecl, expr)                              \
+  IREE_ORT_ASSIGN_OR_RETURN_IMPL(IREE_EP_CONCAT(_iree_ort_err_or_, __LINE__), \
+                                 varDecl, expr)
 
 // ============================================================================
 // Element Type Mapping
