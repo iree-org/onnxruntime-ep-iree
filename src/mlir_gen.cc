@@ -69,26 +69,6 @@ iree_status_t IrpaFileOpenCallback(void* user_data, iree_io_physical_offset_t,
       iree_allocator_system(), out_file_handle);
 }
 
-// Sanitizes an ONNX name to be a valid MLIR SSA identifier.
-// MLIR identifiers must match [a-zA-Z_][a-zA-Z0-9_$]*.
-std::string SanitizeName(const std::string& name) {
-  assert(!name.empty() && "Unexpected empty name");
-  std::string result;
-  result.reserve(name.size());
-  for (char c : name) {
-    if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$') {
-      result += c;
-    } else {
-      result += '_';
-    }
-  }
-  // Ensure starts with letter or underscore.
-  if (!result.empty() && std::isdigit(static_cast<unsigned char>(result[0]))) {
-    result = "_" + result;
-  }
-  return result.empty() ? "_unnamed" : result;
-}
-
 // Joins a vector of strings with a separator.
 std::string Join(const std::vector<std::string>& parts,
                  const std::string& sep) {

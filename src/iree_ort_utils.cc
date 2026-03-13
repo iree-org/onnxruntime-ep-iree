@@ -12,6 +12,8 @@
 
 #include "iree_ort_utils.h"
 
+#include <cassert>
+#include <cctype>
 #include <numeric>
 
 #include "iree/hal/buffer_transfer.h"
@@ -281,6 +283,32 @@ size_t CalculateTensorByteSize(const std::vector<int64_t>& shape,
   size_t num_elements = std::accumulate(shape.begin(), shape.end(), size_t{1},
                                         std::multiplies<size_t>());
   return num_elements * OnnxElementTypeSize(element_type);
+}
+
+// ============================================================================
+// Name Sanitization
+// ============================================================================
+
+std::string SanitizeName(const std::string& name) {
+  assert(!name.empty() && "Unexpected empty name");
+  std::string result;
+  result.reserve(name.size());
+  for (char c : name) {
+    if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') {
+      result += c;
+    } else {
+      result += std::format("${:02X}$", static_cast<unsigned char>(c));
+    }
+  }
+  // MLIR identifiers must start with [a-zA-Z_]. If the first character is a
+  // digit, escape it so we don't collide with names that literally start with
+  // '_' followed by that digit (e.g. "0abc" vs "_0abc").
+  if (!result.empty() && std::isdigit(static_cast<unsigned char>(result[0]))) {
+    char first = result[0];
+    result = std::format("${:02X}$", static_cast<unsigned char>(first)) +
+             result.substr(1);
+  }
+  return result.empty() ? "_unnamed" : result;
 }
 
 }  // namespace onnxruntime::iree

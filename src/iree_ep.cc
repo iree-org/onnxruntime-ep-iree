@@ -241,9 +241,11 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
 
   // Build function name for later lookup.
   // Format: "module.{graph_name}" (defaults to "main" if empty).
+  // Must use SanitizeName to match the name baked into the VMFB by mlir_gen.
   std::string graph_name = graph.GetName();
   std::string function_name =
-      "module." + (graph_name.empty() ? std::string("main") : graph_name);
+      "module." +
+      (graph_name.empty() ? std::string("main") : SanitizeName(graph_name));
 
   // Create NodeComputeInfo with compiled artifacts. Session creation and VMFB
   // loading are deferred to first ComputeImpl call (lazy initialization).

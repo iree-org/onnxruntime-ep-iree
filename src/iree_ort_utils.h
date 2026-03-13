@@ -124,6 +124,19 @@ std::vector<int64_t> GetBufferViewShape(iree_hal_buffer_view_t* buffer_view);
 size_t CalculateTensorByteSize(const std::vector<int64_t>& shape,
                                ONNXTensorElementDataType element_type);
 
+// ============================================================================
+// Name Sanitization
+// ============================================================================
+
+// Sanitizes an ONNX name to be a valid MLIR SSA identifier.
+// MLIR identifiers must match [a-zA-Z_][a-zA-Z0-9_$]*.
+// Uses '$' as an escape delimiter with hex encoding so the mapping is
+// injective. Alphanumerics and '_' pass through unchanged. '$' itself,
+// leading digits, and all other characters are escaped as $XX$.
+// Examples: "input-1" -> "input$2D$1", "input_1" -> "input_1",
+//           "0abc" -> "$30$abc".
+std::string SanitizeName(const std::string& name);
+
 }  // namespace onnxruntime::iree
 
 #endif  // ONNXRUNTIME_EP_IREE_SRC_IREE_ORT_UTILS_H_
