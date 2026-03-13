@@ -143,6 +143,12 @@ static OrtStatus* ParseSpec(DimSpecParseCursor& cursor, DimSpec& dim) {
         std::format("dim_specs: div must be > 0, got {} for \"{}\"", div_val,
                     symbolic_name));
   }
+  if (has_div_arg && div_val > max_val) {
+    return DimSpecError(std::format(
+        "dim_specs: div must be <= max, got div={} max={} for \"{}\" "
+        "(no value in range is a positive multiple of div)",
+        div_val, max_val, symbolic_name));
+  }
 
   dim = {symbolic_name, min_val, max_val, div_val};
   return nullptr;

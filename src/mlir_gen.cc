@@ -306,7 +306,7 @@ class MlirGenerator {
       }
     }
 
-    // Collect symbolic dimension names for graph inputs and outputs.
+    // Collect symbolic dimension names for graph inputs.
     // These are used for dim spec matching (static specialization and
     // divisibility constraints).
     for (const auto& input : graph_inputs_) {
@@ -317,27 +317,16 @@ class MlirGenerator {
       input_symbolic_dims_.push_back(
           input.TypeInfo().GetTensorTypeAndShapeInfo().GetSymbolicDimensions());
     }
-    for (const auto& output : graph_outputs_) {
-      if (output.TypeInfo().GetONNXType() != ONNX_TYPE_TENSOR) {
-        output_symbolic_dims_.emplace_back();
-        continue;
-      }
-      output_symbolic_dims_.push_back(output.TypeInfo()
-                                          .GetTensorTypeAndShapeInfo()
-                                          .GetSymbolicDimensions());
-    }
   }
 
   // Configures the generator for a variant (dim specs, function name suffix).
   // Must be called before EmitFunctionHeader/EmitFunctionBody for each variant.
   void ConfigureForVariant(const DimSpecVariant& specs,
                            const std::string& suffix) {
-    dim_specs_ = specs;
-
-    // Build constraint lookup: symbolic_name -> DimSpec*.
+    // Build constraint lookup: symbolic_name -> DimSpec.
     constraint_specs_.clear();
-    for (const auto& spec : dim_specs_) {
-      constraint_specs_[spec.symbolic_name] = &spec;
+    for (const auto& spec : specs) {
+      constraint_specs_[spec.symbolic_name] = spec;
     }
 
     // Determine which inputs have at least one constrained dynamic dim.
@@ -357,8 +346,8 @@ class MlirGenerator {
       }
     }
 
-    graph_name_ = SanitizeName(graph_.GetName());
-    if (graph_name_.empty()) graph_name_ = "main";
+    std::string raw_name = graph_.GetName();
+    graph_name_ = raw_name.empty() ? "main" : SanitizeName(raw_name);
     graph_name_ += suffix;
   }
 
@@ -1030,9 +1019,10 @@ class MlirGenerator {
         }
         if (!out_assume_index.contains(sym_name)) {
           out_assume_index[sym_name] = out_canonical_assumes.size();
-          out_canonical_assumes.push_back(
-              {sym_name, std::format("%{}_assumed", SanitizeName(sym_name)),
-               dim_ssa, spec_it->second});
+          out_canonical_assumes.push_back(CanonicalAssumeInfo{
+              sym_name,
+              std::format("%dim_assumed_{}", out_canonical_assumes.size()),
+              dim_ssa, &spec_it->second});
         }
       }
 
@@ -1132,10 +1122,8 @@ class MlirGenerator {
   std::ostream& out_;
   std::string irpa_path_;
   TargetConfig target_config_;
-  DimSpecVariant dim_specs_;
-
-  // Lookup map: symbolic_name -> DimSpec* for all specs in current variant.
-  std::unordered_map<std::string, const DimSpec*> constraint_specs_;
+  // Lookup map: symbolic_name -> DimSpec for all specs in current variant.
+  std::unordered_map<std::string, DimSpec> constraint_specs_;
 
   // Input indices that have at least one constrained dynamic dim.
   std::unordered_set<size_t> constrained_inputs_;
@@ -1152,10 +1140,8 @@ class MlirGenerator {
   // Extern dispatch state.
   int extern_id_ = 0;
 
-  // Symbolic dimension names per graph input/output (parallel to
-  // graph_inputs_/graph_outputs_).
+  // Symbolic dimension names per graph input (parallel to graph_inputs_).
   std::vector<std::vector<const char*>> input_symbolic_dims_;
-  std::vector<std::vector<const char*>> output_symbolic_dims_;
 };
 
 // Builds an IRPA parameter archive for large initializers.

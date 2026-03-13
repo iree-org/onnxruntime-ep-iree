@@ -11,6 +11,16 @@ from onnx import TensorProto, helper
 
 _rng = np.random.default_rng(42)
 
+# ORT-specific exceptions (avoids bare `except Exception`).
+# ORT has many flat exception types with no common base class.
+_ort_state = ort.capi.onnxruntime_pybind11_state
+OrtError = tuple(
+    getattr(_ort_state, name)
+    for name in dir(_ort_state)
+    if isinstance(getattr(_ort_state, name), type)
+    and issubclass(getattr(_ort_state, name), Exception)
+)
+
 
 def _save_model(model, tmp_path):
     """Save ONNX model into tmp_path. Pytest cleans up the directory."""
@@ -215,9 +225,8 @@ def test_zero_size_dim_with_divisibility(iree_device, tmp_path):
         expected = x @ weight_data
         result = session.run(None, {"input": x})[0]
         np.testing.assert_allclose(result, expected, rtol=1e-4, atol=1e-4)
-    except Exception:
-        # Some backends may not handle zero-size tensors. The key is no crash.
-        pass
+    except OrtError as e:
+        pytest.skip(f"Backend does not support zero-size tensors: {e}")
 
 
 @pytest.mark.parametrize(
@@ -283,10 +292,9 @@ def test_shared_dim_conflict_fallback(iree_device, tmp_path):
         result2 = session.run(None, {"A": a2, "B": b2})[0]
         # If it runs, verify the result shape is reasonable.
         assert result2.shape[1] == feat_b, f"unexpected output shape: {result2.shape}"
-    except Exception:
+    except OrtError as e:
         # Some backends may reject shape mismatches at the IREE level.
-        # That's acceptable -- the key is no segfault/abort.
-        pass
+        pytest.skip(f"Backend rejected shape mismatch: {e}")
 
 
 # ============================================================================
@@ -321,8 +329,8 @@ def test_parse_error(dim_specs, iree_device, tmp_path):
     """Invalid dim_specs must be rejected by the parser.
 
     Each must cause the EP to reject the session (either via exception or
-    CPU fallback). The old code threw std::runtime_error inside a noexcept
-    function, causing std::terminate -- no crash is the baseline requirement.
+    CPU fallback). ORT silently falls back to CPU when EP creation fails,
+    so we check both outcomes.
     """
     model_path, _ = _create_matmul_model(tmp_path)
     try:
@@ -331,7 +339,7 @@ def test_parse_error(dim_specs, iree_device, tmp_path):
             iree_device,
             {"target_arch": "host", "dim_specs": dim_specs},
         )
-    except Exception:
+    except OrtError:
         # Exception raised = parser detected the error.
         return
 
@@ -364,7 +372,7 @@ def test_unknown_dim_spec_rejected(dim_specs, iree_device, tmp_path):
             iree_device,
             {"target_arch": "host", "dim_specs": dim_specs},
         )
-    except Exception:
+    except OrtError:
         return
 
     # Session created without crash. ORT fell back to CPU -- verify
@@ -429,8 +437,8 @@ def test_mlir_static_specialization(iree_device):
     assert match, "could not parse tie_shape operands"
     operands = [x.strip() for x in match.group(1).split(",")]
     assert operands == [
-        "%batch_assumed",
-        "%seq_assumed",
+        "%dim_assumed_0",
+        "%dim_assumed_1",
     ], f"tie_shape operand order mismatch: {operands}"
 
 
@@ -522,8 +530,8 @@ def test_mlir_shared_symbolic_dims(iree_device):
     ), f"tie_shape ops use different operands: {tie_operands}"
     canonical_operands = [x.strip() for x in tie_operands[0].split(",")]
     assert canonical_operands == [
-        "%batch_assumed"
-    ], f"expected canonical operand ['%batch_assumed'], got {canonical_operands}"
+        "%dim_assumed_0"
+    ], f"expected canonical operand ['%dim_assumed_0'], got {canonical_operands}"
 
 
 def test_mlir_partially_constrained_dims(iree_device):
@@ -574,3 +582,33 @@ def test_mlir_multi_variant_ordering(iree_device):
     assert mlir.index("_variant0") < mlir.index(
         "_variant1"
     ), "_variant0 should appear before _variant1"
+
+
+def test_mlir_assume_ssa_uniqueness(iree_device):
+    """Symbolic dims that sanitize identically get unique SSA names.
+
+    'dim-1' and 'dim_1' both sanitize to 'dim_1', but the generated
+    util.assume.int SSA names must not collide.
+    """
+    model, _ = _make_matmul_model(batch_dim="dim-1", seq_dim="dim_1")
+    mlir, err = try_generate_mlir(
+        model,
+        iree_device,
+        kernel_dir="",
+        target_arch="host",
+        extra_provider_options={"dim_specs": "dim-1(1,128), dim_1(1,256)"},
+    )
+    assert mlir is not None, err
+
+    # Both constraints should produce util.assume.int ops.
+    assume_lines = [l for l in mlir.split("\n") if "util.assume.int" in l]
+    assert (
+        len(assume_lines) == 2
+    ), f"expected 2 util.assume.int ops, got {len(assume_lines)}"
+
+    # Extract SSA names (the LHS of each assume line, before ' = ').
+    ssa_names = [l.strip().split(" = ")[0] for l in assume_lines]
+
+    assert (
+        ssa_names[0] != ssa_names[1]
+    ), f"SSA names should be unique but both are {ssa_names[0]}"

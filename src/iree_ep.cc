@@ -195,7 +195,13 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
         .release();
   }
 
-  // TODO: Do we need to handle multiple graphs?
+  if (count != 1) {
+    return Ort::Status(("IREE EP: Expected exactly 1 graph, got " +
+                        std::to_string(count) + ".")
+                           .c_str(),
+                       ORT_INVALID_ARGUMENT)
+        .release();
+  }
   Ort::ConstGraph graph{graphs[0]};
 
   // Determine how many variants we need (specialized + generic fallback).
@@ -238,6 +244,29 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
     ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                           "IREE EP: Saving IRPA to: %s",
                           irpa_file.Path().c_str());
+  }
+
+  // Build symbolic dimension mappings for runtime dispatch.
+  auto dim_mappings = BuildSymbolicDimMappings(graph);
+
+  // Validate that all dim_spec keys reference known symbolic dims.
+  {
+    std::unordered_set<std::string> known_dims;
+    for (const auto& m : dim_mappings) {
+      known_dims.insert(m.symbolic_name);
+    }
+    for (const auto& variant : dim_spec_variants) {
+      for (const auto& spec : variant) {
+        if (known_dims.contains(spec.symbolic_name)) continue;
+        return Ort::Status(
+                   std::format("dim_specs: key \"{}\" does not match any "
+                               "symbolic dimension in the graph inputs",
+                               spec.symbolic_name)
+                       .c_str(),
+                   ORT_INVALID_ARGUMENT)
+            .release();
+      }
+    }
   }
 
   // Phase 1: Generate MLIR.
@@ -304,29 +333,6 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
         {"module." + function_names[i], mlir_variants[i].second});
   }
 
-  // Build symbolic dimension mappings for runtime dispatch.
-  auto dim_mappings = BuildSymbolicDimMappings(graph);
-
-  // Validate that all dim_spec keys reference known symbolic dims.
-  {
-    std::unordered_set<std::string> known_dims;
-    for (const auto& m : dim_mappings) {
-      known_dims.insert(m.symbolic_name);
-    }
-    for (const auto& variant : dim_spec_variants) {
-      for (const auto& spec : variant) {
-        if (known_dims.contains(spec.symbolic_name)) continue;
-        return Ort::Status(
-                   std::format("dim_specs: key \"{}\" does not match any "
-                               "symbolic dimension in the graph inputs",
-                               spec.symbolic_name)
-                       .c_str(),
-                   ORT_INVALID_ARGUMENT)
-            .release();
-      }
-    }
-  }
-
   size_t num_variants = variant_infos.size();
   auto* info = new IreeNodeComputeInfo(
       *ep, std::move(vmfb_data), std::move(parameter_index),
@@ -388,11 +394,9 @@ static DispatchDimState CollectDimValuesAndConflicts(
     const std::vector<IreeNodeComputeInfo::SymbolicDimMapping>& dim_mappings) {
   DispatchDimState state;
   for (const auto& mapping : dim_mappings) {
-    if (mapping.input_index >= ctx.GetInputCount()) continue;
     auto shape = ctx.GetInput(mapping.input_index)
                      .GetTensorTypeAndShapeInfo()
                      .GetShape();
-    if (mapping.dim_index >= shape.size()) continue;
     int64_t actual_value = shape[mapping.dim_index];
     auto [it, inserted] =
         state.dim_values.try_emplace(mapping.symbolic_name, actual_value);
