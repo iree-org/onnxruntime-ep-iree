@@ -38,9 +38,11 @@ def _make_add_model(input_names):
 
 
 def _generate_mlir(input_names, cpu_device, target_arch):
-    """Helper: build model and return MLIR text, failing on error."""
+    """Helper: build model and return MLIR text, failing on error or compile failure."""
     model = _make_add_model(input_names)
-    mlir, err = try_generate_mlir(model, cpu_device, "", target_arch)
+    mlir, err = try_generate_mlir(
+        model, cpu_device, "", target_arch, assert_compiles=True
+    )
     assert err is None, f"MLIR generation failed: {err}"
     return mlir
 

@@ -226,7 +226,7 @@ def try_compile(model, device, kernel_dir, target_arch):
         pathlib.Path(model_path).unlink(missing_ok=True)
 
 
-def try_generate_mlir(model, device, kernel_dir, target_arch):
+def try_generate_mlir(model, device, kernel_dir, target_arch, assert_compiles=False):
     """Generate MLIR for a model via the EP. Returns (mlir_str, error_msg).
 
     Uses save_intermediates to keep the MLIR file that the EP writes before
@@ -236,12 +236,18 @@ def try_generate_mlir(model, device, kernel_dir, target_arch):
     Distinguishing MLIR-gen errors from iree-compile errors:
     - Session succeeds -> MLIR gen succeeded; find and return the MLIR file.
     - Error contains "iree-compile" -> MLIR gen succeeded but iree-compile
-      failed; find and return the MLIR file.
+      failed; find and return the MLIR file (unless assert_compiles is True).
     - Error without "iree-compile" -> MLIR gen itself failed; return error.
+
+    Args:
+        assert_compiles: If True, treat iree-compile failures as errors
+            instead of returning the MLIR. This verifies the generated MLIR
+            is also valid for compilation.
 
     Returns:
         (mlir_content, None) on successful MLIR generation.
-        (None, error_msg) if MLIR generation itself fails (before iree-compile).
+        (None, error_msg) if MLIR generation itself fails (before iree-compile),
+            or if assert_compiles is True and iree-compile fails.
     """
     with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as f:
         model_path = f.name
@@ -301,6 +307,9 @@ def try_generate_mlir(model, device, kernel_dir, target_arch):
     # Session failed. Check whether MLIR gen succeeded (error from
     # iree-compile) or MLIR gen itself failed.
     if "iree-compile" in err:
+        if assert_compiles:
+            _cleanup()
+            return None, err
         # iree-compile failed, but MLIR gen succeeded -- return the MLIR.
         if mlir_path:
             try:
