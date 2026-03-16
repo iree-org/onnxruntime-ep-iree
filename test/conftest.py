@@ -248,10 +248,13 @@ def try_generate_mlir(model, device, kernel_dir, target_arch):
         onnx.save(model, model_path)
 
     # Use a private temp directory so the EP's TempFile (which reads
-    # std::filesystem::temp_directory_path() -> TMPDIR) writes only here.
+    # std::filesystem::temp_directory_path()) writes only here.
+    # On POSIX this reads TMPDIR; on Windows it reads TMP/TEMP.
     private_tmp = tempfile.mkdtemp(prefix="iree_ep_test_")
-    old_tmpdir = os.environ.get("TMPDIR")
-    os.environ["TMPDIR"] = private_tmp
+    _tmp_vars = ["TMPDIR", "TMP", "TEMP"]
+    _old_tmp = {v: os.environ.get(v) for v in _tmp_vars}
+    for v in _tmp_vars:
+        os.environ[v] = private_tmp
 
     err = None
     try:
@@ -267,11 +270,12 @@ def try_generate_mlir(model, device, kernel_dir, target_arch):
     except Exception as e:
         err = str(e)
     finally:
-        # Restore TMPDIR immediately.
-        if old_tmpdir is not None:
-            os.environ["TMPDIR"] = old_tmpdir
-        else:
-            os.environ.pop("TMPDIR", None)
+        # Restore temp env vars immediately.
+        for v in _tmp_vars:
+            if _old_tmp[v] is not None:
+                os.environ[v] = _old_tmp[v]
+            else:
+                os.environ.pop(v, None)
         pathlib.Path(model_path).unlink(missing_ok=True)
 
     # Locate the MLIR file in the private temp directory.
