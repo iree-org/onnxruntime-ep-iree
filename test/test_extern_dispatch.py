@@ -104,7 +104,7 @@ def vi(name, dtype, shape):
 class TestValidConfigs:
     """Tests that should generate valid MLIR."""
 
-    def test_basic_single_extern(self, gpu_device, kernel_dir, target_arch):
+    def test_basic_single_extern(self, device, kernel_dir, target_arch):
         """Basic: Relu -> ExternDispatch(sigmoid)."""
         relu = helper.make_node("Relu", ["input"], ["relu_out"])
         ext = make_extern_node(
@@ -120,7 +120,7 @@ class TestValidConfigs:
             [vi("output", F32, [4])],
             value_info=[vi("relu_out", F32, [4])],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         assert "hal.dispatch.extern" in mlir
         assert "#hal.executable.target" in mlir
@@ -130,7 +130,7 @@ class TestValidConfigs:
         assert '"sigmoid_extern"' in mlir
         assert "tensor<4xf32>" in mlir
 
-    def test_extern_only_no_onnx_ops(self, gpu_device, kernel_dir, target_arch):
+    def test_extern_only_no_onnx_ops(self, device, kernel_dir, target_arch):
         """ExternDispatch as the only node (no standard ONNX ops)."""
         ext = make_extern_node(
             ["input"],
@@ -144,12 +144,12 @@ class TestValidConfigs:
             [vi("input", F32, [4])],
             [vi("output", F32, [4])],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         assert "hal.dispatch.extern" in mlir
         assert "onnx.Relu" not in mlir
 
-    def test_no_push_constants(self, gpu_device, kernel_dir, target_arch):
+    def test_no_push_constants(self, device, kernel_dir, target_arch):
         """ExternDispatch with zero push constants."""
         ext = make_extern_node(
             ["input"],
@@ -162,11 +162,11 @@ class TestValidConfigs:
             [vi("input", F32, [4])],
             [vi("output", F32, [4])],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         assert "hal.dispatch.extern" in mlir
 
-    def test_multiple_push_constants(self, gpu_device, kernel_dir, target_arch):
+    def test_multiple_push_constants(self, device, kernel_dir, target_arch):
         """Three literal push constants."""
         ext = make_extern_node(
             ["input"],
@@ -180,7 +180,7 @@ class TestValidConfigs:
             [vi("input", F32, [4])],
             [vi("output", F32, [4])],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         assert "hal.dispatch.extern" in mlir
         # Three push constants as i32.
@@ -188,7 +188,7 @@ class TestValidConfigs:
         assert "8 : i32" in mlir
         assert "16 : i32" in mlir
 
-    def test_push_constant_from_input_ref(self, gpu_device, kernel_dir, target_arch):
+    def test_push_constant_from_input_ref(self, device, kernel_dir, target_arch):
         """Push constant from $1 (scalar i64 input)."""
         ext = make_extern_node(
             ["input", "n_elements"],
@@ -202,13 +202,13 @@ class TestValidConfigs:
             [vi("input", F32, [4]), vi("n_elements", I64, [])],
             [vi("output", F32, [4])],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         assert "hal.dispatch.extern" in mlir
         assert "tensor.extract" in mlir
         assert "arith.trunci" in mlir
 
-    def test_two_chained_externs(self, gpu_device, kernel_dir, target_arch):
+    def test_two_chained_externs(self, device, kernel_dir, target_arch):
         """Two ExternDispatches in sequence (SSA numbering)."""
         ext1 = make_extern_node(
             ["input"],
@@ -230,12 +230,12 @@ class TestValidConfigs:
             [vi("output", F32, [4])],
             value_info=[vi("mid", F32, [4])],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         # Two dispatches.
         assert mlir.count("hal.dispatch.extern") == 2
 
-    def test_mixed_onnx_and_extern(self, gpu_device, kernel_dir, target_arch):
+    def test_mixed_onnx_and_extern(self, device, kernel_dir, target_arch):
         """Relu -> ExternDispatch -> Relu (interleaved)."""
         relu1 = helper.make_node("Relu", ["input"], ["relu1_out"])
         ext = make_extern_node(
@@ -255,12 +255,12 @@ class TestValidConfigs:
                 vi("sigmoid_out", F32, [4]),
             ],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         assert "hal.dispatch.extern" in mlir
         assert mlir.count("onnx.Relu") == 2
 
-    def test_two_inputs(self, gpu_device, kernel_dir, target_arch):
+    def test_two_inputs(self, device, kernel_dir, target_arch):
         """ExternDispatch with two input bindings."""
         ext = make_extern_node(
             ["a", "b"],
@@ -274,13 +274,13 @@ class TestValidConfigs:
             [vi("a", F32, [4]), vi("b", F32, [4])],
             [vi("output", F32, [4])],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         assert "hal.dispatch.extern" in mlir
         # Two to_builtin_tensor bridges for two inputs.
         assert mlir.count("torch_c.to_builtin_tensor") == 2
 
-    def test_two_outputs(self, gpu_device, kernel_dir, target_arch):
+    def test_two_outputs(self, device, kernel_dir, target_arch):
         """ExternDispatch producing two output bindings."""
         ext = make_extern_node(
             ["input"],
@@ -294,13 +294,13 @@ class TestValidConfigs:
             [vi("input", F32, [4])],
             [vi("out_a", F32, [4]), vi("out_b", F32, [4])],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         assert "hal.dispatch.extern" in mlir
         # Two from_builtin_tensor bridges for two outputs.
         assert mlir.count("torch_c.from_builtin_tensor") == 2
 
-    def test_multi_input_multi_output(self, gpu_device, kernel_dir, target_arch):
+    def test_multi_input_multi_output(self, device, kernel_dir, target_arch):
         """ExternDispatch with two inputs and two outputs."""
         ext = make_extern_node(
             ["a", "b"],
@@ -314,13 +314,13 @@ class TestValidConfigs:
             [vi("a", F32, [4]), vi("b", F32, [4])],
             [vi("out_a", F32, [4]), vi("out_b", F32, [4])],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         assert "hal.dispatch.extern" in mlir
         assert mlir.count("torch_c.to_builtin_tensor") == 2
         assert mlir.count("torch_c.from_builtin_tensor") == 2
 
-    def test_input_ref_later_input(self, gpu_device, kernel_dir, target_arch):
+    def test_input_ref_later_input(self, device, kernel_dir, target_arch):
         """Input ref $2 referencing a later (non-first) input."""
         ext = make_extern_node(
             ["a", "b", "n_val"],
@@ -334,12 +334,12 @@ class TestValidConfigs:
             [vi("a", F32, [4]), vi("b", F32, [8]), vi("n_val", I64, [])],
             [vi("output", F32, [4])],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         assert "hal.dispatch.extern" in mlir
         assert "tensor.extract" in mlir
 
-    def test_mixed_dtypes_single_dispatch(self, gpu_device, kernel_dir, target_arch):
+    def test_mixed_dtypes_single_dispatch(self, device, kernel_dir, target_arch):
         """Mixed data dtypes (f32 + bf16) and mixed scalar dtypes (i32 + i64)
         in a single ExternDispatch node."""
         ext = make_extern_node(
@@ -359,7 +359,7 @@ class TestValidConfigs:
             ],
             [vi("out_f32", F32, [4])],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         assert "hal.dispatch.extern" in mlir
         # Both data bindings present with correct types.
@@ -384,7 +384,7 @@ class TestValidConfigs:
         ],
         ids=["f16", "f64", "bf16", "i32", "i8"],
     )
-    def test_data_types(self, dtype, shape, gpu_device, kernel_dir, target_arch):
+    def test_data_types(self, dtype, shape, device, kernel_dir, target_arch):
         """ExternDispatch generates correct MLIR types."""
         ext = make_extern_node(
             ["input"],
@@ -398,7 +398,7 @@ class TestValidConfigs:
             [vi("input", dtype, shape)],
             [vi("output", dtype, shape)],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         assert "hal.dispatch.extern" in mlir
         expected_type = f"tensor<4x{MLIR_TYPES[dtype]}>"
@@ -416,9 +416,7 @@ class TestValidConfigs:
         ],
         ids=["scalar_1", "vec_128", "mat_4x8", "tensor_2x3x4"],
     )
-    def test_shapes(
-        self, shape, expected_shape_str, gpu_device, kernel_dir, target_arch
-    ):
+    def test_shapes(self, shape, expected_shape_str, device, kernel_dir, target_arch):
         """ExternDispatch generates correct tensor shapes."""
         n = 1
         for d in shape:
@@ -435,7 +433,7 @@ class TestValidConfigs:
             [vi("input", F32, shape)],
             [vi("output", F32, shape)],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         assert "hal.dispatch.extern" in mlir
         expected_type = f"tensor<{expected_shape_str}f32>"
@@ -463,7 +461,7 @@ class TestValidConfigs:
         ],
     )
     def test_workgroup_configs(
-        self, wg_size, wg_count, gpu_device, kernel_dir, target_arch
+        self, wg_size, wg_count, device, kernel_dir, target_arch
     ):
         """Various valid workgroup size/count combinations."""
         ext = make_extern_node(
@@ -478,7 +476,7 @@ class TestValidConfigs:
             [vi("input", F32, [4])],
             [vi("output", F32, [4])],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         assert "hal.dispatch.extern" in mlir
         wg_str = f"workgroup_size = [{wg_size[0]} : index, {wg_size[1]} : index, {wg_size[2]} : index]"
@@ -494,9 +492,7 @@ class TestValidConfigs:
         ],
         ids=["dynamic_x", "dynamic_y", "dynamic_z", "all_dynamic"],
     )
-    def test_dynamic_workgroup_count(
-        self, wg_count, gpu_device, kernel_dir, target_arch
-    ):
+    def test_dynamic_workgroup_count(self, wg_count, device, kernel_dir, target_arch):
         """Dynamic $N references are valid for all three workgroup_count dims."""
         ext = make_extern_node(
             ["input", "wg_x", "wg_y", "wg_z"],
@@ -515,7 +511,7 @@ class TestValidConfigs:
             ],
             [vi("output", F32, [4])],
         )
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is not None, err
         assert "tensor.extract" in mlir
         assert "arith.index_cast" in mlir
@@ -529,7 +525,7 @@ class TestValidConfigs:
 class TestMissingAttributes:
     """Missing required attributes should produce clear errors."""
 
-    def test_missing_kernel_name(self, gpu_device, kernel_dir, target_arch):
+    def test_missing_kernel_name(self, device, kernel_dir, target_arch):
         node = helper.make_node(
             "ExternDispatch",
             inputs=["input"],
@@ -541,11 +537,11 @@ class TestMissingAttributes:
             workgroup_count=["1", "1", "1"],
         )
         model = make_model([node], [vi("input", F32, [4])], [vi("output", F32, [4])])
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is None
         assert "kernel_name" in err
 
-    def test_missing_kernel_object(self, gpu_device, kernel_dir, target_arch):
+    def test_missing_kernel_object(self, device, kernel_dir, target_arch):
         node = helper.make_node(
             "ExternDispatch",
             inputs=["input"],
@@ -557,11 +553,11 @@ class TestMissingAttributes:
             workgroup_count=["1", "1", "1"],
         )
         model = make_model([node], [vi("input", F32, [4])], [vi("output", F32, [4])])
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is None
         assert "kernel_object" in err
 
-    def test_missing_workgroup_size(self, gpu_device, kernel_dir, target_arch):
+    def test_missing_workgroup_size(self, device, kernel_dir, target_arch):
         node = helper.make_node(
             "ExternDispatch",
             inputs=["input"],
@@ -573,11 +569,11 @@ class TestMissingAttributes:
             workgroup_count=["1", "1", "1"],
         )
         model = make_model([node], [vi("input", F32, [4])], [vi("output", F32, [4])])
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is None
         assert "workgroup_size" in err
 
-    def test_missing_workgroup_count(self, gpu_device, kernel_dir, target_arch):
+    def test_missing_workgroup_count(self, device, kernel_dir, target_arch):
         node = helper.make_node(
             "ExternDispatch",
             inputs=["input"],
@@ -589,7 +585,7 @@ class TestMissingAttributes:
             push_constants=["4"],
         )
         model = make_model([node], [vi("input", F32, [4])], [vi("output", F32, [4])])
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is None
         assert "workgroup_count" in err
 
@@ -606,7 +602,7 @@ class TestInvalidWorkgroupCount:
         ids=["too_few", "too_many"],
     )
     def test_wrong_element_count(
-        self, wg_count, expected_err, gpu_device, kernel_dir, target_arch
+        self, wg_count, expected_err, device, kernel_dir, target_arch
     ):
         ext = make_extern_node(
             ["input"],
@@ -616,7 +612,7 @@ class TestInvalidWorkgroupCount:
             workgroup_count=wg_count,
         )
         model = make_model([ext], [vi("input", F32, [4])], [vi("output", F32, [4])])
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is None
         assert expected_err in err
 
@@ -629,7 +625,7 @@ class TestInvalidWorkgroupCount:
         ],
         ids=["non_numeric_x", "non_numeric_y", "non_numeric_z"],
     )
-    def test_non_numeric(self, wg_count, gpu_device, kernel_dir, target_arch):
+    def test_non_numeric(self, wg_count, device, kernel_dir, target_arch):
         ext = make_extern_node(
             ["input"],
             ["output"],
@@ -638,7 +634,7 @@ class TestInvalidWorkgroupCount:
             workgroup_count=wg_count,
         )
         model = make_model([ext], [vi("input", F32, [4])], [vi("output", F32, [4])])
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is None
         assert "not a valid" in err
 
@@ -656,7 +652,7 @@ class TestInvalidWorkgroupSize:
         ids=["one", "two", "four"],
     )
     def test_wrong_element_count(
-        self, wg_size, expected_err, gpu_device, kernel_dir, target_arch
+        self, wg_size, expected_err, device, kernel_dir, target_arch
     ):
         ext = make_extern_node(
             ["input"],
@@ -666,7 +662,7 @@ class TestInvalidWorkgroupSize:
             workgroup_count=["1", "1", "1"],
         )
         model = make_model([ext], [vi("input", F32, [4])], [vi("output", F32, [4])])
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is None
         assert expected_err in err
 
@@ -679,7 +675,7 @@ class TestInvalidWorkgroupSize:
         ],
         ids=["zero_x", "zero_y", "negative_z"],
     )
-    def test_non_positive(self, wg_size, gpu_device, kernel_dir, target_arch):
+    def test_non_positive(self, wg_size, device, kernel_dir, target_arch):
         ext = make_extern_node(
             ["input"],
             ["output"],
@@ -688,7 +684,7 @@ class TestInvalidWorkgroupSize:
             workgroup_count=["1", "1", "1"],
         )
         model = make_model([ext], [vi("input", F32, [4])], [vi("output", F32, [4])])
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is None
         assert "must be positive" in err
 
@@ -696,7 +692,7 @@ class TestInvalidWorkgroupSize:
 class TestInvalidPushConstants:
     """Invalid push_constants specs."""
 
-    def test_non_numeric(self, gpu_device, kernel_dir, target_arch):
+    def test_non_numeric(self, device, kernel_dir, target_arch):
         ext = make_extern_node(
             ["input"],
             ["output"],
@@ -705,11 +701,11 @@ class TestInvalidPushConstants:
             workgroup_count=["1", "1", "1"],
         )
         model = make_model([ext], [vi("input", F32, [4])], [vi("output", F32, [4])])
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is None
         assert "not a valid" in err
 
-    def test_oob_input_reference(self, gpu_device, kernel_dir, target_arch):
+    def test_oob_input_reference(self, device, kernel_dir, target_arch):
         """$5 with only 1 input should error."""
         ext = make_extern_node(
             ["input"],
@@ -719,11 +715,11 @@ class TestInvalidPushConstants:
             workgroup_count=["1", "1", "1"],
         )
         model = make_model([ext], [vi("input", F32, [4])], [vi("output", F32, [4])])
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is None
         assert "only 1 inputs available" in err
 
-    def test_malformed_input_ref(self, gpu_device, kernel_dir, target_arch):
+    def test_malformed_input_ref(self, device, kernel_dir, target_arch):
         """Malformed $ syntax (no number after $)."""
         ext = make_extern_node(
             ["input"],
@@ -733,11 +729,11 @@ class TestInvalidPushConstants:
             workgroup_count=["1", "1", "1"],
         )
         model = make_model([ext], [vi("input", F32, [4])], [vi("output", F32, [4])])
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is None
         assert "not a valid" in err
 
-    def test_non_scalar_input_ref(self, gpu_device, kernel_dir, target_arch):
+    def test_non_scalar_input_ref(self, device, kernel_dir, target_arch):
         """$0 on a non-scalar tensor (rank > 0) should error."""
         ext = make_extern_node(
             ["input"],
@@ -747,7 +743,7 @@ class TestInvalidPushConstants:
             workgroup_count=["1", "1", "1"],
         )
         model = make_model([ext], [vi("input", F32, [4])], [vi("output", F32, [4])])
-        mlir, err = try_generate_mlir(model, gpu_device, kernel_dir, target_arch)
+        mlir, err = try_generate_mlir(model, device, kernel_dir, target_arch)
         assert mlir is None
         assert "rank" in err.lower() or "scalar" in err.lower()
 

@@ -1060,7 +1060,21 @@ TargetConfig TargetConfig::Create(const std::string& target_arch,
   TargetConfig config;
   config.target_arch = target_arch;
   config.backend = backend;
-  if (backend == "hip") {
+  // Derive the HAL executable target from target_arch, not the runtime backend.
+  // This decouples MLIR generation from the runtime device, enabling
+  // cross-compilation (e.g. generating gfx1100 MLIR on a CPU-only host).
+  if (target_arch.starts_with("gfx")) {
+    // AMD GPU (e.g. "gfx1100", "gfx1201").
+    config.hal_backend = "rocm";
+    config.hal_format = "rocm-hsaco-fb";
+  } else if (target_arch.starts_with("sm_")) {
+    // NVIDIA GPU (e.g. "sm_80", "sm_90").
+    config.hal_backend = "cuda";
+    config.hal_format = "cuda-nvptx-fb";
+  } else if (target_arch == "vulkan-spirv") {
+    config.hal_backend = "vulkan-spirv";
+    config.hal_format = "vulkan-spirv-fb";
+  } else if (backend == "hip") {
     config.hal_backend = "rocm";
     config.hal_format = "rocm-hsaco-fb";
   } else if (backend == "cuda") {
@@ -1070,6 +1084,7 @@ TargetConfig TargetConfig::Create(const std::string& target_arch,
     config.hal_backend = "vulkan-spirv";
     config.hal_format = "vulkan-spirv-fb";
   }
+  // else: hal_backend stays empty -> ExternDispatch rejected at MLIR gen time.
   return config;
 }
 

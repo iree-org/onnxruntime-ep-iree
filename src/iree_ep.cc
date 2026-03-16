@@ -27,30 +27,46 @@
 namespace onnxruntime::iree {
 
 static std::vector<std::string> GenerateCompileFlags(
-    const IreeEp::Config& config) {
+    const IreeEp::Config& config, const TargetConfig& target_config) {
   std::vector<std::string> flags;
 
-  if (config.backend == "llvm-cpu") {
-    flags.push_back("--iree-hal-target-device=local");
-    flags.push_back("--iree-hal-local-target-device-backends=llvm-cpu");
-    flags.push_back("--iree-llvmcpu-target-cpu=host");
-    if (config.opt_level == "O2" || config.opt_level == "O3") {
-      flags.push_back("--iree-opt-data-tiling");
-    }
-  } else if (config.backend == "vulkan") {
-    flags.push_back("--iree-hal-target-device=vulkan");
-  } else if (config.backend == "cuda") {
-    flags.push_back("--iree-hal-target-device=cuda");
-    if (!config.target_arch.empty()) {
-      flags.push_back("--iree-cuda-target=" + config.target_arch);
-    }
-  } else if (config.backend == "hip") {
+  // Derive compilation target from target_arch when possible.  This makes
+  // compile flags consistent with the MLIR executable target (which is also
+  // derived from target_arch in TargetConfig::Create) and enables
+  // cross-compilation: a CPU-only host can compile GPU-targeted MLIR and cache
+  // the resulting VMFB for later use on a GPU machine via EP context caching.
+  if (target_config.hal_backend == "rocm") {
     flags.push_back("--iree-hal-target-device=hip");
-    if (!config.target_arch.empty()) {
-      flags.push_back("--iree-hip-target=" + config.target_arch);
-    }
+    flags.push_back("--iree-hip-target=" + config.target_arch);
+  } else if (target_config.hal_backend == "cuda") {
+    flags.push_back("--iree-hal-target-device=cuda");
+    flags.push_back("--iree-cuda-target=" + config.target_arch);
+  } else if (target_config.hal_backend == "vulkan-spirv") {
+    flags.push_back("--iree-hal-target-device=vulkan");
   } else {
-    assert(false && "Unsupported backend, should have been caught earlier");
+    // No GPU target_arch set; fall back to the runtime device backend.
+    if (config.backend == "llvm-cpu") {
+      flags.push_back("--iree-hal-target-device=local");
+      flags.push_back("--iree-hal-local-target-device-backends=llvm-cpu");
+      flags.push_back("--iree-llvmcpu-target-cpu=host");
+      if (config.opt_level == "O2" || config.opt_level == "O3") {
+        flags.push_back("--iree-opt-data-tiling");
+      }
+    } else if (config.backend == "vulkan") {
+      flags.push_back("--iree-hal-target-device=vulkan");
+    } else if (config.backend == "cuda") {
+      flags.push_back("--iree-hal-target-device=cuda");
+      if (!config.target_arch.empty()) {
+        flags.push_back("--iree-cuda-target=" + config.target_arch);
+      }
+    } else if (config.backend == "hip") {
+      flags.push_back("--iree-hal-target-device=hip");
+      if (!config.target_arch.empty()) {
+        flags.push_back("--iree-hip-target=" + config.target_arch);
+      }
+    } else {
+      assert(false && "Unsupported backend, should have been caught earlier");
+    }
   }
 
   // Extern dispatch support: add search path for pre-compiled kernel objects.
@@ -204,14 +220,15 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
 
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: Generating MLIR");
-  ORT_RETURN_IF_ERROR(GenerateMlir(
-      graph, ep->ort_api, mlir_file.Path(), irpa_file.Path(), parameter_index,
-      parameter_provider, std::move(target_config)));
+  ORT_RETURN_IF_ERROR(GenerateMlir(graph, ep->ort_api, mlir_file.Path(),
+                                   irpa_file.Path(), parameter_index,
+                                   parameter_provider, target_config));
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: MLIR Generated Successfully");
 
   // Phase 2: Compile MLIR to VMFB.
-  std::vector<std::string> flags = GenerateCompileFlags(ep->config_);
+  std::vector<std::string> flags =
+      GenerateCompileFlags(ep->config_, target_config);
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: Generating VMFB");
   ORT_RETURN_IF_ERROR(

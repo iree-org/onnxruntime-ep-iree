@@ -152,7 +152,14 @@ def target_arch(request):
 
 @pytest.fixture(scope="session")
 def device(request, register_ep):
-    """Get any available IREE device. Prefers HIP, falls back to any."""
+    """Get any available IREE device. Prefers HIP, falls back to local-task.
+
+    Uses only devices that have an ``iree.driver`` metadata key, which
+    identifies real IREE devices (as opposed to the generic ORT CPU device
+    that ORT itself exposes).  This allows MLIR-generation tests to run in
+    CI environments that have no GPU by falling back to the local-task CPU
+    driver.
+    """
     ep_devices = ort.get_ep_devices()
     if not ep_devices:
         pytest.skip("No IREE devices available")
@@ -163,7 +170,15 @@ def device(request, register_ep):
     ]
     if hip_devices and idx < len(hip_devices):
         return hip_devices[idx]
-    # Fall back to any device.
+    # Fall back to local-task for CPU-side MLIR generation (e.g. in CI).
+    local_task = _get_iree_device("local-task")
+    if local_task:
+        return local_task
+    # Fall back to any device with a known IREE driver.
+    known = [dev for dev in ep_devices if dev.device.metadata.get("iree.driver", "")]
+    if known:
+        return known[0]
+    # Absolute last resort.
     if idx < len(ep_devices):
         return ep_devices[idx]
     return ep_devices[0]
@@ -229,14 +244,14 @@ def try_compile(model, device, kernel_dir, target_arch):
 def try_generate_mlir(model, device, kernel_dir, target_arch):
     """Generate MLIR for a model via the EP. Returns (mlir_str, error_msg).
 
-    Uses save_intermediates to keep the MLIR file that the EP writes before
-    invoking iree-compile.  Runs with a private temp directory (via TMPDIR)
-    so that concurrent test runs cannot interfere with each other.
+    Uses save_intermediates so the EP keeps the MLIR file on disk.  Runs with
+    a private temp directory (via TMPDIR) so that concurrent test runs cannot
+    interfere with each other.
 
     Distinguishing MLIR-gen errors from iree-compile errors:
-    - Session succeeds -> MLIR gen succeeded; find and return the MLIR file.
+    - Session succeeds -> MLIR gen and compilation both worked.
     - Error contains "iree-compile" -> MLIR gen succeeded but iree-compile
-      failed; find and return the MLIR file.
+      failed; find and return the saved MLIR file.
     - Error without "iree-compile" -> MLIR gen itself failed; return error.
 
     Returns:
