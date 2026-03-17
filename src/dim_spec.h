@@ -24,16 +24,16 @@ namespace onnxruntime::iree {
 // A single dimension constraint for specialization.
 struct DimSpec {
   std::string symbolic_name;
-  int64_t min;  // Minimum value (inclusive), >= 0.
+  int64_t min;  // Minimum value (inclusive), >= 1.
   int64_t max;  // Maximum value (inclusive), >= min.
-  int64_t div;  // Divisibility constraint. 0 = none.
+  int64_t div;  // Divisibility constraint. 1 = none.
 };
 
 // A set of dimension constraints forming one specialization variant.
 using DimSpecVariant = std::vector<DimSpec>;
 
 // Parses the "ep.iree.dim_specs" session option string.
-// Format: "batch(1,1), seq(0,131072,16); batch(1,1), seq(0,65536,8)"
+// Format: "batch(1,1), seq(1,131072,16); batch(1,1), seq(1,65536,8)"
 //   - name(min, max): range constraint. name(min, max, div): range +
 //     divisibility.
 //   - Static dims: min == max (e.g., batch(1,1)).

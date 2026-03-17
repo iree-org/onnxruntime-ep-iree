@@ -1055,7 +1055,7 @@ class MlirGenerator {
   void EmitCanonicalAssumes(
       const std::vector<CanonicalAssumeInfo>& canonical_assumes) {
     for (const auto& assume : canonical_assumes) {
-      if (assume.spec->div > 0) {
+      if (assume.spec->div > 1) {
         out_ << std::format(
             "    {} = util.assume.int {}<umin = {}, umax = {}, udiv = {}> "
             ": index\n",

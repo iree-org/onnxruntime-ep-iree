@@ -227,7 +227,11 @@ def try_compile(model, device, kernel_dir, target_arch):
 
 
 def try_generate_mlir(
-    model, device, kernel_dir, target_arch, extra_provider_options=None,
+    model,
+    device,
+    kernel_dir,
+    target_arch,
+    extra_provider_options=None,
     assert_compiles=False,
 ):
     """Generate MLIR for a model via the EP. Returns (mlir_str, error_msg).
@@ -258,11 +262,11 @@ def try_generate_mlir(
 
     # Use a private temp directory so the EP's TempFile (which reads
     # std::filesystem::temp_directory_path()) writes only here.
-    # On POSIX this reads TMPDIR; on Windows it reads TMP then TEMP.
+    # On POSIX this reads TMPDIR; on Windows it reads TMP/TEMP.
     private_tmp = tempfile.mkdtemp(prefix="iree_ep_test_")
-    temp_vars = ("TMPDIR", "TMP", "TEMP")
-    old_temp_env = {v: os.environ.get(v) for v in temp_vars}
-    for v in temp_vars:
+    _tmp_vars = ["TMPDIR", "TMP", "TEMP"]
+    _old_tmp = {v: os.environ.get(v) for v in _tmp_vars}
+    for v in _tmp_vars:
         os.environ[v] = private_tmp
 
     err = None
@@ -282,9 +286,9 @@ def try_generate_mlir(
         err = str(e)
     finally:
         # Restore temp env vars immediately.
-        for v in temp_vars:
-            if old_temp_env[v] is not None:
-                os.environ[v] = old_temp_env[v]
+        for v in _tmp_vars:
+            if _old_tmp[v] is not None:
+                os.environ[v] = _old_tmp[v]
             else:
                 os.environ.pop(v, None)
         pathlib.Path(model_path).unlink(missing_ok=True)

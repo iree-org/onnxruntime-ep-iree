@@ -13,7 +13,6 @@
 
 #include "iree_ep.h"
 
-#include <format>
 #include <fstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -30,9 +29,8 @@
 namespace onnxruntime::iree {
 
 // Builds symbolic dimension mappings from graph inputs. Returns ALL occurrences
-// of each symbolic dimension (not deduplicated). This allows ComputeImpl to
-// verify that all inputs sharing a symbolic dim agree on the actual value
-// before dispatching to a specialized variant.
+// of each symbolic dimension (not deduplicated). ComputeImpl reads actual
+// values from these mappings at runtime for variant dispatch.
 static std::vector<IreeNodeComputeInfo::SymbolicDimMapping>
 BuildSymbolicDimMappings(const Ort::ConstGraph& graph) {
   std::vector<IreeNodeComputeInfo::SymbolicDimMapping> mappings;
@@ -216,7 +214,7 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
   TempFile vmfb_file(".vmfb");
   TempFile irpa_file(".irpa");
 
-  // If save_intermediates is enabled, mark files to be kept for debugging.
+  // save_intermediates: keep all artifacts on disk for debugging/inspection.
   if (ep->config_.save_intermediates) {
     mlir_file.Keep();
     vmfb_file.Keep();
@@ -249,26 +247,6 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
   // Build symbolic dimension mappings for runtime dispatch.
   auto dim_mappings = BuildSymbolicDimMappings(graph);
 
-  // Validate that all dim_spec keys reference known symbolic dims.
-  {
-    std::unordered_set<std::string> known_dims;
-    for (const auto& m : dim_mappings) {
-      known_dims.insert(m.symbolic_name);
-    }
-    for (const auto& variant : dim_spec_variants) {
-      for (const auto& spec : variant) {
-        if (known_dims.contains(spec.symbolic_name)) continue;
-        return Ort::Status(
-                   std::format("dim_specs: key \"{}\" does not match any "
-                               "symbolic dimension in the graph inputs",
-                               spec.symbolic_name)
-                       .c_str(),
-                   ORT_INVALID_ARGUMENT)
-            .release();
-      }
-    }
-  }
-
   // Phase 1: Generate MLIR.
   ParameterIndexPtr parameter_index;
   ParameterProviderPtr parameter_provider;
@@ -294,14 +272,14 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
                    mlir_variants, function_names, parameter_index,
                    parameter_provider, std::move(target_config)));
 
-  // Phase 2: Compile the single MLIR to one VMFB.
+  // Phase 2: Compile MLIR to VMFB.
   std::vector<std::string> flags = GenerateCompileFlags(ep->config_);
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: Compiling VMFB...");
+                       "IREE EP: Generating VMFB");
   ORT_RETURN_IF_ERROR(
       CompileToVmfb(mlir_file.Path(), vmfb_file.Path(), flags, ep->ort_api));
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: VMFB compiled successfully");
+                       "IREE EP: VMFB Generated Successfully");
 
   // Phase 3: Read VMFB into memory. Session creation is deferred to first
   // execution, which allows the VMFB to be cached and loaded on a different
@@ -324,8 +302,8 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
         .release();
   }
 
-  // Build unresolved variant info for lazy init. Function names are prefixed
-  // with "module." for VMFB lookup.
+  // Build variant info for lazy init.
+  // Format: "module.{graph_name}{variant_suffix}" for VMFB function lookup.
   std::vector<IreeNodeComputeInfo::VariantInfo> variant_infos;
   variant_infos.reserve(function_names.size());
   for (size_t i = 0; i < function_names.size(); ++i) {
@@ -362,58 +340,39 @@ void ORT_API_CALL IreeEp::ReleaseNodeComputeInfosImpl(
 // Dim Spec Dispatch Helpers
 // ============================================================================
 
-namespace {
-
-struct DispatchDimState {
-  std::unordered_map<std::string, int64_t> dim_values;
-  bool has_conflict = false;
-};
-}  // namespace
-
 static bool VariantMatchesDimSpecs(
     const IreeNodeComputeInfo::Variant& variant,
-    const std::unordered_map<std::string, int64_t>& dim_values,
-    bool has_conflict) {
-  // If inputs disagree on a shared symbolic dim, skip specialized variants
-  // (they apply tie_shape which assumes all occurrences are equal).
-  if (has_conflict && !variant.dim_specs.empty()) return false;
-
+    const std::unordered_map<std::string, int64_t>& dim_values) {
   for (const auto& spec : variant.dim_specs) {
     auto it = dim_values.find(spec.symbolic_name);
     if (it == dim_values.end()) continue;
 
     int64_t actual = it->second;
     if (actual < spec.min || actual > spec.max) return false;
-    if (spec.div > 0 && (actual <= 0 || actual % spec.div != 0)) return false;
+    if (spec.div > 1 && actual % spec.div != 0) return false;
   }
   return true;
 }
 
-static DispatchDimState CollectDimValuesAndConflicts(
+static std::unordered_map<std::string, int64_t> CollectDimValues(
     const Ort::KernelContext& ctx,
     const std::vector<IreeNodeComputeInfo::SymbolicDimMapping>& dim_mappings) {
-  DispatchDimState state;
+  std::unordered_map<std::string, int64_t> dim_values;
   for (const auto& mapping : dim_mappings) {
     auto shape = ctx.GetInput(mapping.input_index)
                      .GetTensorTypeAndShapeInfo()
                      .GetShape();
-    int64_t actual_value = shape[mapping.dim_index];
-    auto [it, inserted] =
-        state.dim_values.try_emplace(mapping.symbolic_name, actual_value);
-    if (!inserted && it->second != actual_value) {
-      state.has_conflict = true;
-    }
+    dim_values.try_emplace(mapping.symbolic_name, shape[mapping.dim_index]);
   }
-  return state;
+  return dim_values;
 }
 
 static const IreeNodeComputeInfo::Variant* SelectMatchingVariant(
     const std::vector<IreeNodeComputeInfo::Variant>& variants,
-    const std::unordered_map<std::string, int64_t>& dim_values,
-    bool has_conflict) {
+    const std::unordered_map<std::string, int64_t>& dim_values) {
   // Variants are in user-specified order (first match wins).
   for (const auto& variant : variants) {
-    if (VariantMatchesDimSpecs(variant, dim_values, has_conflict)) {
+    if (VariantMatchesDimSpecs(variant, dim_values)) {
       return &variant;
     }
   }
@@ -521,10 +480,8 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
 
   Ort::KernelContext ctx(kernel_context);
 
-  DispatchDimState dispatch_state =
-      CollectDimValuesAndConflicts(ctx, info->dim_mappings_);
-  const Variant* selected = SelectMatchingVariant(
-      info->variants_, dispatch_state.dim_values, dispatch_state.has_conflict);
+  auto dim_values = CollectDimValues(ctx, info->dim_mappings_);
+  const Variant* selected = SelectMatchingVariant(info->variants_, dim_values);
   assert(selected && "At least the generic fallback variant should match");
 
   iree_hal_device_t* device = info->ep.IreeDevice();

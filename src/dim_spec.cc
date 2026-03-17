@@ -114,7 +114,7 @@ static OrtStatus* ParseSpec(DimSpecParseCursor& cursor, DimSpec& dim) {
   int64_t max_val = 0;
   ORT_RETURN_IF_ERROR(ParseIntArg(cursor, symbolic_name, "max", max_val));
 
-  int64_t div_val = 0;
+  int64_t div_val = 1;
   bool has_div_arg = false;
   if (!IsAtEnd(cursor) && Peek(cursor) == ',') {
     ++cursor.pos;  // Consume ',' before div.
@@ -128,9 +128,9 @@ static OrtStatus* ParseSpec(DimSpecParseCursor& cursor, DimSpec& dim) {
   }
   ++cursor.pos;  // Consume ')'.
 
-  if (min_val < 0) {
+  if (min_val < 1) {
     return DimSpecError(
-        std::format("dim_specs: min must be >= 0, got {} for \"{}\"", min_val,
+        std::format("dim_specs: min must be >= 1, got {} for \"{}\"", min_val,
                     symbolic_name));
   }
   if (max_val < min_val) {
@@ -208,7 +208,7 @@ static OrtStatus* ParseDimSpecsImpl(std::string_view spec_str,
 
 }  // namespace
 
-// Parses dim_specs in the format "batch(1,1), seq(0,131072,16)".
+// Parses dim_specs in the format "batch(1,1), seq(1,131072,16)".
 // Semicolons separate variants. Commas outside parentheses separate specs.
 // Each spec is name(min, max) or name(min, max, div).
 OrtStatus* ParseDimSpecs(const std::string& spec_str,

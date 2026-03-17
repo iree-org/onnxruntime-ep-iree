@@ -169,9 +169,9 @@ def test_static_specialization(iree_device, tmp_path):
 
 
 def test_divisibility_specialization(iree_device, tmp_path):
-    """Divisibility dim_specs: seq(0,131072,16) works with seq=32."""
+    """Divisibility dim_specs: seq(1,131072,16) works with seq=32."""
     model_path, weight_data = _create_matmul_model(tmp_path)
-    dim_specs = "seq(0,131072,16)"
+    dim_specs = "seq(1,131072,16)"
     session = _create_session(
         model_path, iree_device, {"target_arch": "host", "dim_specs": dim_specs}
     )
@@ -187,7 +187,7 @@ def test_multi_variant_dispatch(iree_device, tmp_path):
     Dispatch checks variants in dim_specs order (first match wins).
     """
     model_path, weight_data = _create_matmul_model(tmp_path)
-    dim_specs = "batch(1,1), seq(64,64); seq(0,131072,16)"
+    dim_specs = "batch(1,1), seq(64,64); seq(1,131072,16)"
     session = _create_session(
         model_path, iree_device, {"target_arch": "host", "dim_specs": dim_specs}
     )
@@ -202,7 +202,7 @@ def test_multi_variant_dispatch(iree_device, tmp_path):
 def test_partially_constrained_dims(iree_device, tmp_path):
     """dim_specs constrains only seq; batch remains fully dynamic."""
     model_path, weight_data = _create_matmul_model(tmp_path)
-    dim_specs = "seq(0,131072,16)"
+    dim_specs = "seq(1,131072,16)"
     session = _create_session(
         model_path, iree_device, {"target_arch": "host", "dim_specs": dim_specs}
     )
@@ -213,9 +213,9 @@ def test_partially_constrained_dims(iree_device, tmp_path):
 
 
 def test_zero_size_dim_with_divisibility(iree_device, tmp_path):
-    """seq(0,131072,16) with actual seq=0 should fall to generic."""
+    """seq(1,131072,16) with actual seq=0 should fall to generic."""
     model_path, weight_data = _create_matmul_model(tmp_path)
-    dim_specs = "seq(0,131072,16)"
+    dim_specs = "seq(1,131072,16)"
     session = _create_session(
         model_path, iree_device, {"target_arch": "host", "dim_specs": dim_specs}
     )
@@ -250,51 +250,12 @@ def test_whitespace_and_divisibility_by_one(iree_device, tmp_path):
     """dim_specs with extra whitespace; divisibility by 1 (always matches)."""
     model_path, weight_data = _create_matmul_model(tmp_path)
     # Whitespace around delimiters.
-    dim_specs = "  seq( 0 , 131072 , 1 )  "
+    dim_specs = "  seq( 1 , 131072 , 1 )  "
     session = _create_session(
         model_path, iree_device, {"target_arch": "host", "dim_specs": dim_specs}
     )
     # div=1 matches any positive seq value.
     _run_matmul(session, 2, 7, weight_data)
-
-
-def test_shared_dim_conflict_fallback(iree_device, tmp_path):
-    """Inputs sharing a symbolic dim with different runtime values must not crash.
-
-    If input A has batch=4 and input B has batch=8, dispatch must not select a
-    specialized variant (whose tie_shape assumes all batch dims are equal).
-    The generic fallback has no tie_shape assumptions and is safe.
-
-    Note: Mismatched shared symbolic dims is a model-level error. This test
-    verifies that the EP handles it gracefully (no crash/segfault) rather than
-    applying incorrect tie_shape assumptions from a specialized variant.
-    """
-    feat_a, feat_b = 10, 20
-    model_path, weight_data = _create_add_model(tmp_path, feat_a=feat_a, feat_b=feat_b)
-    dim_specs = "batch(0,131072,4)"
-    session = _create_session(
-        model_path, iree_device, {"target_arch": "host", "dim_specs": dim_specs}
-    )
-
-    # Run with matching batch dims first (sanity check).
-    a = _rng.random((8, feat_a)).astype(np.float32)
-    b = _rng.random((8, feat_b)).astype(np.float32)
-    expected = a @ weight_data + b
-    result = session.run(None, {"A": a, "B": b})[0]
-    np.testing.assert_allclose(result, expected, rtol=1e-4, atol=1e-4)
-
-    # Run with conflicting batch dims (A:batch=4, B:batch=8).
-    # Both satisfy the spec individually, but they disagree on "batch".
-    # The EP should fall through to the generic fallback without crashing.
-    a2 = _rng.random((4, feat_a)).astype(np.float32)
-    b2 = _rng.random((8, feat_b)).astype(np.float32)
-    try:
-        result2 = session.run(None, {"A": a2, "B": b2})[0]
-        # If it runs, verify the result shape is reasonable.
-        assert result2.shape[1] == feat_b, f"unexpected output shape: {result2.shape}"
-    except OrtError as e:
-        # Some backends may reject shape mismatches at the IREE level.
-        pytest.skip(f"Backend rejected shape mismatch: {e}")
 
 
 # ============================================================================
@@ -313,6 +274,7 @@ def test_shared_dim_conflict_fallback(iree_device, tmp_path):
         pytest.param("batch(abc,1)"),
         pytest.param("batch(1,abc)"),
         pytest.param("batch(1,2,abc)"),
+        pytest.param("batch(0,1)"),
         pytest.param("batch(-1,1)"),
         pytest.param("batch(5,3)"),
         pytest.param("batch(1,2,0)"),
@@ -341,38 +303,6 @@ def test_parse_error(dim_specs, iree_device, tmp_path):
         )
     except OrtError:
         # Exception raised = parser detected the error.
-        return
-
-    # Session created without crash. ORT fell back to CPU -- verify
-    # our EP is not active.
-    providers = session.get_providers()
-    assert not any(
-        "IREE" in p for p in providers
-    ), f"IREE EP should have rejected dim_specs={dim_specs!r}"
-
-
-@pytest.mark.parametrize(
-    "dim_specs",
-    [
-        pytest.param("batc(1,1), seq(64,64)"),
-        pytest.param("foo(5,5)"),
-        pytest.param("batch(1,1); xyz(0,131072,16)"),
-    ],
-)
-def test_unknown_dim_spec_rejected(dim_specs, iree_device, tmp_path):
-    """dim_specs referencing a non-existent symbolic dim must be rejected.
-
-    If a user makes a typo (e.g., "batc" instead of "batch"), the EP should
-    reject it at compile time rather than silently ignoring the constraint.
-    """
-    model_path, _ = _create_matmul_model(tmp_path)
-    try:
-        session = _create_session(
-            model_path,
-            iree_device,
-            {"target_arch": "host", "dim_specs": dim_specs},
-        )
-    except OrtError:
         return
 
     # Session created without crash. ORT fell back to CPU -- verify
@@ -450,15 +380,15 @@ def test_mlir_divisibility(iree_device):
         iree_device,
         kernel_dir="",
         target_arch="host",
-        extra_provider_options={"dim_specs": "seq(0,131072,16)"},
+        extra_provider_options={"dim_specs": "seq(1,131072,16)"},
     )
     assert mlir is not None, err
 
     # Should use util.assume.int (not torch.symbolic_int).
     assert "util.assume.int" in mlir, "MLIR should contain util.assume.int ops"
 
-    # Should have range+div: umin = 0, umax = 131072, udiv = 16.
-    assert "umin = 0" in mlir, "should have umin = 0"
+    # Should have range+div: umin = 1, umax = 131072, udiv = 16.
+    assert "umin = 1" in mlir, "should have umin = 1"
     assert "umax = 131072" in mlir, "should have umax = 131072"
     assert "udiv = 16" in mlir, "should have udiv = 16"
 
@@ -482,7 +412,7 @@ def test_mlir_mixed_static_and_divisibility(iree_device):
         iree_device,
         kernel_dir="",
         target_arch="host",
-        extra_provider_options={"dim_specs": "batch(1,1), seq(0,131072,16)"},
+        extra_provider_options={"dim_specs": "batch(1,1), seq(1,131072,16)"},
     )
     assert mlir is not None, err
 
@@ -506,7 +436,7 @@ def test_mlir_shared_symbolic_dims(iree_device):
         iree_device,
         kernel_dir="",
         target_arch="host",
-        extra_provider_options={"dim_specs": "batch(0,131072,4)"},
+        extra_provider_options={"dim_specs": "batch(1,131072,4)"},
     )
     assert mlir is not None, err
 
@@ -542,7 +472,7 @@ def test_mlir_partially_constrained_dims(iree_device):
         iree_device,
         kernel_dir="",
         target_arch="host",
-        extra_provider_options={"dim_specs": "seq(0,131072,16)"},
+        extra_provider_options={"dim_specs": "seq(1,131072,16)"},
     )
     assert mlir is not None, err
 
@@ -565,7 +495,7 @@ def test_mlir_multi_variant_ordering(iree_device):
         kernel_dir="",
         target_arch="host",
         extra_provider_options={
-            "dim_specs": "batch(1,1), seq(64,64); seq(0,131072,16)"
+            "dim_specs": "batch(1,1), seq(64,64); seq(1,131072,16)"
         },
     )
     assert mlir is not None, err
