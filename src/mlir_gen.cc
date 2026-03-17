@@ -29,7 +29,6 @@
 #include "iree/io/formats/irpa/irpa_builder.h"
 #include "iree/io/parameter_index.h"
 #include "iree/io/parameter_index_provider.h"
-#include "iree_ep.h"
 #include "iree_ort_utils.h"
 
 namespace onnxruntime::iree {
@@ -228,15 +227,7 @@ class MlirGenerator {
     function_names.clear();
     function_names.reserve(variants.size());
 
-    // Define the #executable_target alias for hal.dispatch.extern objects()
-    // clauses. This is harmless when no extern dispatches are present.
-    if (!target_config_.hal_backend.empty()) {
-      out_ << "#executable_target = #hal.executable.target<\""
-           << target_config_.hal_backend << "\", \""
-           << target_config_.hal_format << "\", {target_arch = \""
-           << target_config_.target_arch << "\"}>\n";
-    }
-    out_ << "module {\n";
+    EmitModulePrologue();
     for (const auto& v : variants) {
       ConfigureForVariant(*v.specs, v.suffix);
       function_names.push_back(graph_name_);
@@ -346,9 +337,26 @@ class MlirGenerator {
       }
     }
 
+    // ONNX allows empty graph names; MLIR functions need a valid name.
     std::string raw_name = graph_.GetName();
     graph_name_ = raw_name.empty() ? "main" : SanitizeName(raw_name);
     graph_name_ += suffix;
+  }
+
+  // Emits the module-level prologue.
+  void EmitModulePrologue() {
+    // Define the #executable_target alias for hal.dispatch.extern objects()
+    // clauses. This is harmless when no extern dispatches are present.
+    // We intentionally do NOT set hal.device.targets on the module — device
+    // targeting is handled by iree-compile CLI flags (--iree-hal-target-device,
+    // --iree-hip-target, etc.).
+    if (!target_config_.hal_backend.empty()) {
+      out_ << "#executable_target = #hal.executable.target<\""
+           << target_config_.hal_backend << "\", \""
+           << target_config_.hal_format << "\", {target_arch = \""
+           << target_config_.target_arch << "\"}>\n";
+    }
+    out_ << "module {\n";
   }
 
   // Emits the function signature with current dim specs and function name.
@@ -1124,10 +1132,8 @@ class MlirGenerator {
   TargetConfig target_config_;
   // Lookup map: symbolic_name -> DimSpec for all specs in current variant.
   std::unordered_map<std::string, DimSpec> constraint_specs_;
-
   // Input indices that have at least one constrained dynamic dim.
   std::unordered_set<size_t> constrained_inputs_;
-
   std::string graph_name_;
   int64_t ir_version_ = 8;
   int64_t opset_version_ = 17;
@@ -1139,7 +1145,6 @@ class MlirGenerator {
 
   // Extern dispatch state.
   int extern_id_ = 0;
-
   // Symbolic dimension names per graph input (parallel to graph_inputs_).
   std::vector<std::vector<const char*>> input_symbolic_dims_;
 };

@@ -193,6 +193,7 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
         .release();
   }
 
+  // TODO: Do we need to handle multiple graphs?
   if (count != 1) {
     return Ort::Status(("IREE EP: Expected exactly 1 graph, got " +
                         std::to_string(count) + ".")
@@ -247,7 +248,8 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
   // Build symbolic dimension mappings for runtime dispatch.
   auto dim_mappings = BuildSymbolicDimMappings(graph);
 
-  // Phase 1: Generate MLIR.
+  // Phase 1: Generate MLIR from the graph.
+  // Also builds an IRPA parameter archive for large initializers.
   ParameterIndexPtr parameter_index;
   ParameterProviderPtr parameter_provider;
 
@@ -311,6 +313,8 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
         {"module." + function_names[i], mlir_variants[i].second});
   }
 
+  // Create NodeComputeInfo with compiled artifacts. Session creation and VMFB
+  // loading are deferred to first ComputeImpl call (lazy initialization).
   size_t num_variants = variant_infos.size();
   auto* info = new IreeNodeComputeInfo(
       *ep, std::move(vmfb_data), std::move(parameter_index),
@@ -345,11 +349,16 @@ static bool VariantMatchesDimSpecs(
     const std::unordered_map<std::string, int64_t>& dim_values) {
   for (const auto& spec : variant.dim_specs) {
     auto it = dim_values.find(spec.symbolic_name);
-    if (it == dim_values.end()) continue;
-
+    if (it == dim_values.end()) {
+      continue;
+    }
     int64_t actual = it->second;
-    if (actual < spec.min || actual > spec.max) return false;
-    if (spec.div > 1 && actual % spec.div != 0) return false;
+    if (actual < spec.min || actual > spec.max) {
+      return false;
+    }
+    if (spec.div > 1 && actual % spec.div != 0) {
+      return false;
+    }
   }
   return true;
 }

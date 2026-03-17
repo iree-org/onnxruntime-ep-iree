@@ -176,7 +176,6 @@ struct IreeNodeComputeInfo : OrtNodeComputeInfo {
 
   // Unresolved variant descriptions from compilation.
   std::vector<VariantInfo> variant_infos_;
-
   // Mappings from symbolic names to input tensor positions for dispatch.
   std::vector<SymbolicDimMapping> dim_mappings_;
 
