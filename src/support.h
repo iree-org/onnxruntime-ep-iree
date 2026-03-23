@@ -7,6 +7,9 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // ErrorOr<T>: a type representing either a value T or an error message.
+// ErrorCode: semantic error category, translated at the ORT API boundary.
+//   Bridged ORT statuses are coarsened to the nearest category; this is
+//   intentional — ErrorCode is not a lossless encoding of OrtErrorCode.
 //
 //===----------------------------------------------------------------------===//
 
@@ -23,9 +26,24 @@
 
 namespace onnxruntime::iree {
 
-// Holds an error message. Always represents a failure.
+// Semantic error category used throughout internal code. Translated to
+// OrtErrorCode only at the ORT API boundary (see iree_ort_utils.h).
+//
+// This is intentionally not a lossless encoding of OrtErrorCode: bridged ORT
+// statuses are coarsened to the nearest category (e.g. ORT_INVALID_GRAPH ->
+// kInvalidArgument). Internal errors set the most specific category available.
+enum class ErrorCode {
+  kUnknown,
+  kInvalidArgument,
+  kNotFound,    // maps to ORT_NOT_FOUND
+  kNoSuchFile,  // maps to ORT_NO_SUCHFILE (file-system not-found)
+  kNotImplemented,
+};
+
+// Holds an error message and category. Always represents a failure.
 struct [[nodiscard]] ErrorObject {
   std::string message;
+  ErrorCode code = ErrorCode::kUnknown;
 };
 
 // Represents either a value T or an ErrorObject.
@@ -40,8 +58,7 @@ struct [[nodiscard]] ErrorObject {
 //   }
 //
 //   OrtStatus* caller() {
-//     IREE_ORT_ASSIGN_OR_RETURN(std::string s, format());
-//     // use s ...
+//     IREE_ORT_RETURN_IF_MAYBE_ERROR(use(format()));
 //   }
 template <typename T>
 class [[nodiscard]] ErrorOr {
@@ -52,7 +69,9 @@ class [[nodiscard]] ErrorOr {
   ErrorOr(U&& val) : storage_(std::in_place_type<T>, std::forward<U>(val)) {}
 
   // Move constructor.
-  ErrorOr(ErrorOr&& other) noexcept : storage_(std::move(other.storage_)) {}
+  ErrorOr(ErrorOr&& other) noexcept(
+      std::is_nothrow_move_constructible_v<std::variant<T, ErrorObject>>)
+      : storage_(std::move(other.storage_)) {}
 
   // Move constructor for compatible types (e.g. ErrorOr<const char*> →
   // ErrorOr<std::string>).
@@ -136,12 +155,32 @@ inline bool isError(const ErrorOr<T>& e) {
   return !e.hasValue();
 }
 
-// Factory: create an ErrorObject. Accepts std::format arguments directly.
+// Factory: create an ErrorObject with kUnknown category.
 // Usage: return error("bad attribute '{}': {}", name, reason);
 template <typename... Args>
 inline ErrorObject error(std::format_string<Args...> fmt, Args&&... args) {
   return ErrorObject{std::format(fmt, std::forward<Args>(args)...)};
 }
+
+// Factory: create an ErrorObject with an explicit category.
+// Usage: return errorWithCode(ErrorCode::kNotImplemented, "type {} not
+// supported", t);
+template <typename... Args>
+inline ErrorObject errorWithCode(ErrorCode code,
+                                 std::format_string<Args...> fmt,
+                                 Args&&... args) {
+  return ErrorObject{std::format(fmt, std::forward<Args>(args)...), code};
+}
+
+// Represents either success or an error. Like ErrorOr<T> but for functions
+// returning nothing on success. Use ok() for the success case. Inherits
+// [[nodiscard]] from ErrorOr<T>, so silently discarding a returned MaybeError
+// is a compile error.
+using MaybeError = ErrorOr<std::monostate>;
+
+// Success sentinel for MaybeError-returning functions.
+// Usage: return ok();
+inline std::monostate ok() { return {}; }
 
 }  // namespace onnxruntime::iree
 
@@ -152,8 +191,8 @@ inline ErrorObject error(std::format_string<Args...> fmt, Args&&... args) {
 // Evaluates `expr` (which must return ErrorOr<T>), propagates the ErrorObject
 // if in error state, otherwise binds the value to `varDecl`.
 //
-// For use inside ErrorOr<T>-returning functions. For OrtStatus*-returning
-// functions use IREE_ORT_ASSIGN_OR_RETURN instead (in iree_ort_utils.h).
+// For use inside ErrorOr<T>-returning functions. At the ORT boundary use
+// IREE_ORT_RETURN_IF_MAYBE_ERROR (in iree_ort_utils.h) instead.
 //
 // Usage (in a function returning ErrorOr<U>):
 //   IREE_EP_ASSIGN_OR_RETURN(std::string s, FormatAttribute(attr));
@@ -165,5 +204,16 @@ inline ErrorObject error(std::format_string<Args...> fmt, Args&&... args) {
 #define IREE_EP_ASSIGN_OR_RETURN(varDecl, expr)                             \
   IREE_EP_ASSIGN_OR_RETURN_IMPL(IREE_EP_CONCAT(_iree_ep_err_or_, __LINE__), \
                                 varDecl, expr)
+
+// Evaluates `expr` (which must return MaybeError), propagates the error if
+// present. For use inside MaybeError-returning functions.
+//
+// Usage (in a function returning MaybeError):
+//   IREE_EP_RETURN_IF_ERROR(EmitNode(node));
+#define IREE_EP_RETURN_IF_ERROR_IMPL(tmp, expr) \
+  auto tmp = (expr);                            \
+  if (isError(tmp)) return (tmp).getError()
+#define IREE_EP_RETURN_IF_ERROR(expr) \
+  IREE_EP_RETURN_IF_ERROR_IMPL(IREE_EP_CONCAT(_iree_ep_err_, __LINE__), expr)
 
 #endif  // ONNXRUNTIME_EP_IREE_SRC_SUPPORT_H_

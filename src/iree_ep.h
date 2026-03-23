@@ -14,10 +14,12 @@
 #ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_EP_H_
 #define ONNXRUNTIME_EP_IREE_SRC_IREE_EP_H_
 
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include "dim_spec.h"
 #include "iree_ep_factory.h"
 #include "iree_wrappers.h"
 #include "ort_import.h"
@@ -47,6 +49,8 @@ class IreeEp : public OrtEp, public ApiPtrs {
     // Path to directory containing pre-compiled kernel objects (.co files).
     // When non-empty, enables extern dispatch support.
     std::string extern_kernel_path = "";
+    // Parsed dim spec variants from "ep.iree.dim_specs" session option.
+    std::vector<DimSpecVariant> dim_spec_variants;
   };
 
   IreeEp(IreeEpFactory& factory, const std::string& name, const Config& config,
@@ -105,6 +109,9 @@ class IreeEp : public OrtEp, public ApiPtrs {
 // (device-bound), enabling cross-machine caching: compile on machine A, execute
 // on machine B.
 //
+// Holds one or more IREE function variants for dimension specialization.
+// At runtime, dispatches to the first matching variant in user-provided order.
+//
 // NOTE: Because session creation is lazy, errors such as VMFB loading failures
 // or function lookup mismatches surface on the first Run() call rather than
 // during InferenceSession construction. This is a deliberate trade-off:
@@ -112,12 +119,35 @@ class IreeEp : public OrtEp, public ApiPtrs {
 // while runtime errors (device mismatch, bytecode version skew) are reported
 // at execution time when the target device is actually bound.
 struct IreeNodeComputeInfo : OrtNodeComputeInfo {
+  // A single compiled variant (specialized or generic).
+  // Populated lazily by InitializeSession().
+  struct Variant {
+    iree_vm_function_t function;
+    DimSpecVariant dim_specs;
+  };
+
+  // Unresolved variant info from compilation (before session creation).
+  // Stores function name and dim specs; resolved to Variant during lazy init.
+  struct VariantInfo {
+    std::string function_name;
+    DimSpecVariant dim_specs;
+  };
+
+  // Maps a symbolic dimension name to a specific (input, dim) position so we
+  // can read actual values at runtime for dispatch.
+  struct SymbolicDimMapping {
+    size_t input_index;
+    size_t dim_index;
+    std::string symbolic_name;
+  };
+
   // Constructor takes compiled artifacts. Session is created lazily on first
   // ComputeImpl call.
   IreeNodeComputeInfo(IreeEp& ep, std::vector<uint8_t> vmfb_data,
                       ParameterIndexPtr parameter_index,
                       ParameterProviderPtr parameter_provider,
-                      std::string function_name);
+                      std::vector<VariantInfo> variant_infos,
+                      std::vector<SymbolicDimMapping> dim_mappings);
 
   ~IreeNodeComputeInfo();
 
@@ -143,17 +173,21 @@ struct IreeNodeComputeInfo : OrtNodeComputeInfo {
   std::vector<uint8_t> vmfb_data_;
   ParameterIndexPtr parameter_index_;
   ParameterProviderPtr parameter_provider_;
-  std::string function_name_;
+
+  // Unresolved variant descriptions from compilation.
+  std::vector<VariantInfo> variant_infos_;
+  // Mappings from symbolic names to input tensor positions for dispatch.
+  std::vector<SymbolicDimMapping> dim_mappings_;
 
   // Runtime state (lazily initialized on first ComputeImpl call).
   RuntimeSessionPtr session_;
-  iree_vm_function_t function_{};
+  std::vector<Variant> variants_;
   std::once_flag init_flag_;
   std::string init_error_;
 
  private:
-  // Creates the IREE session, loads VMFB from memory, looks up function.
-  // Called once via std::call_once from ComputeImpl.
+  // Creates the IREE session, loads VMFB from memory, looks up all variant
+  // functions. Called once via std::call_once from ComputeImpl.
   OrtStatus* InitializeSession();
 };
 

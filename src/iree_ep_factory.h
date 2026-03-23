@@ -26,18 +26,8 @@ namespace onnxruntime::iree {
 class IreeAllocator;
 class IreeDataTransfer;
 
-// EP configuration constants
-inline constexpr const char* kEpVendor = "IREE";
+// EP vendor ID used across the codebase to identify IREE devices.
 inline constexpr uint32_t kEpVendorId = 0x1EEE;  // "IREE" in hex-ish
-inline constexpr const char* kEpVersion = "0.1.0";
-
-// Hardware vendor IDs for device matching.
-// These match OrtDevice::VendorIds from onnxruntime/core/framework/ortdevice.h.
-namespace VendorIds {
-inline constexpr uint32_t kAmd = 0x1002;     // AMD: ROCm, MIGraphX EPs
-inline constexpr uint32_t kNvidia = 0x10DE;  // NVIDIA: CUDA/TensorRT
-inline constexpr uint32_t kIntel = 0x8086;   // Intel: OpenVINO
-}  // namespace VendorIds
 
 // Helper struct to pass API pointers
 struct ApiPtrs {
@@ -120,9 +110,6 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
   static OrtStatus* ORT_API_CALL
   GetCustomOpDomainsImpl(OrtEpFactory* this_ptr, OrtCustomOpDomain** domains,
                          size_t num_domains) noexcept;
-
-  // Enumerate IREE devices and create OrtHardwareDevice instances.
-  void CreateIreeHwDevices();
 
   // Member variables
   Ort::Logger logger_;

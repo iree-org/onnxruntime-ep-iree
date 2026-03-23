@@ -14,6 +14,8 @@
 #include "iree_ep.h"
 
 #include <fstream>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "iree/modules/io/parameters/module.h"
@@ -25,6 +27,40 @@
 #include "temp_file.h"
 
 namespace onnxruntime::iree {
+
+// Builds symbolic dimension mappings from graph inputs. Returns ALL occurrences
+// of each symbolic dimension (not deduplicated). ComputeImpl reads actual
+// values from these mappings at runtime for variant dispatch.
+static std::vector<IreeNodeComputeInfo::SymbolicDimMapping>
+BuildSymbolicDimMappings(const Ort::ConstGraph& graph) {
+  std::vector<IreeNodeComputeInfo::SymbolicDimMapping> mappings;
+
+  auto inputs = graph.GetInputs();
+  auto initializers = graph.GetInitializers();
+  std::unordered_set<std::string> init_names;
+  for (const auto& init : initializers) {
+    init_names.insert(init.GetName());
+  }
+
+  size_t input_index = 0;
+  for (const auto& input : inputs) {
+    if (init_names.count(input.GetName())) continue;
+    auto type_info = input.TypeInfo();
+    if (type_info.GetONNXType() == ONNX_TYPE_TENSOR) {
+      auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+      auto shape = tensor_info.GetShape();
+      auto sym_dims = tensor_info.GetSymbolicDimensions();
+      for (size_t d = 0; d < shape.size(); ++d) {
+        if (shape[d] >= 0 || d >= sym_dims.size() || sym_dims[d] == nullptr ||
+            sym_dims[d][0] == '\0')
+          continue;
+        mappings.push_back({input_index, d, std::string(sym_dims[d])});
+      }
+    }
+    input_index++;
+  }
+  return mappings;
+}
 
 static std::vector<std::string> GenerateCompileFlags(
     const IreeEp::Config& config) {
@@ -157,6 +193,23 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
         .release();
   }
 
+  // TODO: Do we need to handle multiple graphs?
+  if (count != 1) {
+    return Ort::Status(("IREE EP: Expected exactly 1 graph, got " +
+                        std::to_string(count) + ".")
+                           .c_str(),
+                       ORT_INVALID_ARGUMENT)
+        .release();
+  }
+  Ort::ConstGraph graph{graphs[0]};
+
+  // Determine how many variants we need (specialized + generic fallback).
+  const auto& dim_spec_variants = ep->config_.dim_spec_variants;
+  size_t num_specialized = dim_spec_variants.size();
+
+  // Variants are dispatched in user-specified order (first match wins).
+  // Preserving caller order makes precedence explicit for overlaps.
+
   // Create temp files for intermediate artifacts.
   TempFile mlir_file(".mlir");
   TempFile vmfb_file(".vmfb");
@@ -192,23 +245,34 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
                           irpa_file.Path().c_str());
   }
 
-  // Phase 1: Generate MLIR from the first graph.
+  // Build symbolic dimension mappings for runtime dispatch.
+  auto dim_mappings = BuildSymbolicDimMappings(graph);
+
+  // Phase 1: Generate MLIR from the graph.
   // Also builds an IRPA parameter archive for large initializers.
-  // TODO: Do we need to handle multiple graphs?
-  Ort::ConstGraph graph{graphs[0]};
   ParameterIndexPtr parameter_index;
   ParameterProviderPtr parameter_provider;
 
+  std::vector<std::pair<std::string, DimSpecVariant>> mlir_variants;
+  for (size_t i = 0; i < num_specialized; ++i) {
+    mlir_variants.emplace_back("_variant" + std::to_string(i),
+                               dim_spec_variants[i]);
+  }
+
+  // Add a generic fallback variant.
+  mlir_variants.emplace_back("", DimSpecVariant{});
+
+  // function_names[i] is the MLIR function name for mlir_variants[i].
+  std::vector<std::string> function_names;
   TargetConfig target_config =
       TargetConfig::Create(ep->config_.target_arch, ep->config_.backend);
-
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: Generating MLIR");
-  ORT_RETURN_IF_ERROR(GenerateMlir(
-      graph, ep->ort_api, mlir_file.Path(), irpa_file.Path(), parameter_index,
-      parameter_provider, std::move(target_config)));
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: MLIR Generated Successfully");
+  ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+                        "IREE EP: Generating MLIR (%zu variants)",
+                        mlir_variants.size());
+  IREE_ORT_RETURN_IF_MAYBE_ERROR(
+      GenerateMlir(graph, ep->ort_api, mlir_file.Path(), irpa_file.Path(),
+                   mlir_variants, function_names, parameter_index,
+                   parameter_provider, std::move(target_config)));
 
   // Phase 2: Compile MLIR to VMFB.
   std::vector<std::string> flags = GenerateCompileFlags(ep->config_);
@@ -219,8 +283,9 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: VMFB Generated Successfully");
 
-  // Read VMFB into memory. Session creation is deferred to first execution,
-  // which allows the VMFB to be cached and loaded on a different device.
+  // Phase 3: Read VMFB into memory. Session creation is deferred to first
+  // execution, which allows the VMFB to be cached and loaded on a different
+  // device.
   std::ifstream vmfb_stream(vmfb_file.Path(), std::ios::binary | std::ios::ate);
   if (!vmfb_stream) {
     return Ort::Status("IREE EP: Failed to open VMFB file", ORT_FAIL).release();
@@ -239,21 +304,27 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
         .release();
   }
 
-  // Build function name for later lookup.
-  // Format: "module.{graph_name}" (defaults to "main" if empty).
-  std::string graph_name = graph.GetName();
-  std::string function_name =
-      "module." + (graph_name.empty() ? std::string("main") : graph_name);
+  // Build variant info for lazy init.
+  // Format: "module.{graph_name}{variant_suffix}" for VMFB function lookup.
+  std::vector<IreeNodeComputeInfo::VariantInfo> variant_infos;
+  variant_infos.reserve(function_names.size());
+  for (size_t i = 0; i < function_names.size(); ++i) {
+    variant_infos.push_back(
+        {"module." + function_names[i], mlir_variants[i].second});
+  }
 
   // Create NodeComputeInfo with compiled artifacts. Session creation and VMFB
   // loading are deferred to first ComputeImpl call (lazy initialization).
+  size_t num_variants = variant_infos.size();
   auto* info = new IreeNodeComputeInfo(
       *ep, std::move(vmfb_data), std::move(parameter_index),
-      std::move(parameter_provider), std::move(function_name));
+      std::move(parameter_provider), std::move(variant_infos),
+      std::move(dim_mappings));
   node_compute_infos[0] = info;
 
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                       "IREE EP: Compilation complete");
+  ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+                        "IREE EP: Compilation complete (%zu variants)",
+                        num_variants);
   return nullptr;
 }
 
@@ -270,18 +341,68 @@ void ORT_API_CALL IreeEp::ReleaseNodeComputeInfosImpl(
 }
 
 // ============================================================================
+// Dim Spec Dispatch Helpers
+// ============================================================================
+
+static bool VariantMatchesDimSpecs(
+    const IreeNodeComputeInfo::Variant& variant,
+    const std::unordered_map<std::string, int64_t>& dim_values) {
+  for (const auto& spec : variant.dim_specs) {
+    auto it = dim_values.find(spec.symbolic_name);
+    if (it == dim_values.end()) {
+      continue;
+    }
+    int64_t actual = it->second;
+    if (actual < spec.min || actual > spec.max) {
+      return false;
+    }
+    if (spec.div > 1 && actual % spec.div != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static std::unordered_map<std::string, int64_t> CollectDimValues(
+    const Ort::KernelContext& ctx,
+    const std::vector<IreeNodeComputeInfo::SymbolicDimMapping>& dim_mappings) {
+  std::unordered_map<std::string, int64_t> dim_values;
+  for (const auto& mapping : dim_mappings) {
+    auto shape = ctx.GetInput(mapping.input_index)
+                     .GetTensorTypeAndShapeInfo()
+                     .GetShape();
+    dim_values.try_emplace(mapping.symbolic_name, shape[mapping.dim_index]);
+  }
+  return dim_values;
+}
+
+static const IreeNodeComputeInfo::Variant* SelectMatchingVariant(
+    const std::vector<IreeNodeComputeInfo::Variant>& variants,
+    const std::unordered_map<std::string, int64_t>& dim_values) {
+  // Variants are in user-specified order (first match wins).
+  for (const auto& variant : variants) {
+    if (VariantMatchesDimSpecs(variant, dim_values)) {
+      return &variant;
+    }
+  }
+  return nullptr;
+}
+
+// ============================================================================
 // IreeNodeComputeInfo Implementation
 // ============================================================================
 
 IreeNodeComputeInfo::IreeNodeComputeInfo(
     IreeEp& ep_ref, std::vector<uint8_t> vmfb_data,
     ParameterIndexPtr parameter_index, ParameterProviderPtr parameter_provider,
-    std::string function_name)
+    std::vector<VariantInfo> variant_infos,
+    std::vector<SymbolicDimMapping> dim_mappings)
     : ep(ep_ref),
       vmfb_data_(std::move(vmfb_data)),
       parameter_index_(std::move(parameter_index)),
       parameter_provider_(std::move(parameter_provider)),
-      function_name_(std::move(function_name)) {
+      variant_infos_(std::move(variant_infos)),
+      dim_mappings_(std::move(dim_mappings)) {
   ort_version_supported = ORT_API_VERSION;
   CreateState = CreateStateImpl;
   Compute = ComputeImpl;
@@ -326,10 +447,15 @@ OrtStatus* IreeNodeComputeInfo::InitializeSession() {
       iree_runtime_session_append_bytecode_module_from_memory(
           session_.Get(), flatbuffer_data, iree_allocator_null()));
 
-  // Phase 4: Lookup function.
-  IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_lookup_function(
-      session_.Get(), iree_make_cstring_view(function_name_.c_str()),
-      &function_));
+  // Phase 4: Lookup all variant functions and populate variants_.
+  variants_.reserve(variant_infos_.size());
+  for (const auto& vi : variant_infos_) {
+    iree_vm_function_t function;
+    IREE_ORT_RETURN_IF_ERROR(iree_runtime_session_lookup_function(
+        session_.Get(), iree_make_cstring_view(vi.function_name.c_str()),
+        &function));
+    variants_.push_back({function, vi.dim_specs});
+  }
 
   return nullptr;
 }
@@ -363,6 +489,10 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
 
   Ort::KernelContext ctx(kernel_context);
 
+  auto dim_values = CollectDimValues(ctx, info->dim_mappings_);
+  const Variant* selected = SelectMatchingVariant(info->variants_, dim_values);
+  assert(selected && "At least the generic fallback variant should match");
+
   iree_hal_device_t* device = info->ep.IreeDevice();
   iree_hal_allocator_t* allocator =
       iree_runtime_session_device_allocator(info->session_.Get());
@@ -384,7 +514,7 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
   // Initialize the call.
   RuntimeCall call;
   IREE_ORT_RETURN_IF_ERROR(iree_runtime_call_initialize(
-      info->session_.Get(), info->function_, call.Get()));
+      info->session_.Get(), selected->function, call.Get()));
   call.MarkInitialized();
 
   // Push input buffer views.

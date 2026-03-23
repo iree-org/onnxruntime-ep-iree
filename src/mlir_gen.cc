@@ -69,26 +69,6 @@ iree_status_t IrpaFileOpenCallback(void* user_data, iree_io_physical_offset_t,
       iree_allocator_system(), out_file_handle);
 }
 
-// Sanitizes an ONNX name to be a valid MLIR SSA identifier.
-// MLIR identifiers must match [a-zA-Z_][a-zA-Z0-9_$]*.
-std::string SanitizeName(const std::string& name) {
-  assert(!name.empty() && "Unexpected empty name");
-  std::string result;
-  result.reserve(name.size());
-  for (char c : name) {
-    if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$') {
-      result += c;
-    } else {
-      result += '_';
-    }
-  }
-  // Ensure starts with letter or underscore.
-  if (!result.empty() && std::isdigit(static_cast<unsigned char>(result[0]))) {
-    result = "_" + result;
-  }
-  return result.empty() ? "_unnamed" : result;
-}
-
 // Joins a vector of strings with a separator.
 std::string Join(const std::vector<std::string>& parts,
                  const std::string& sep) {
@@ -135,15 +115,19 @@ ErrorOr<std::string> GetElementType(ONNXTensorElementDataType dtype,
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
       return "i1";
     default:
-      return error("Unsupported element type: {}", static_cast<int>(dtype));
+      return errorWithCode(ErrorCode::kNotImplemented,
+                           "Unsupported element type: {}",
+                           static_cast<int>(dtype));
   }
 }
 
 // Formats a tensor type as !torch.vtensor<[dims],dtype>.
+// Dynamic dims are always emitted as "?".
 ErrorOr<std::string> FormatTensorType(const Ort::ConstTypeInfo& type_info) {
   if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
-    return error("Non-tensor type {} not supported",
-                 static_cast<int>(type_info.GetONNXType()));
+    return errorWithCode(ErrorCode::kNotImplemented,
+                         "Non-tensor type {} not supported",
+                         static_cast<int>(type_info.GetONNXType()));
   }
 
   auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
@@ -171,10 +155,12 @@ ErrorOr<std::string> FormatTensorType(const Ort::ConstTypeInfo& type_info) {
 
 // Formats a tensor type as tensor<dimsxdtype> (standard MLIR format).
 // Uses signless integer types as required by MLIR tensor dialect.
+// Dynamic dims are always emitted as "?".
 ErrorOr<std::string> FormatMlirTensorType(const Ort::ConstTypeInfo& type_info) {
   if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
-    return error("Non-tensor type {} not supported",
-                 static_cast<int>(type_info.GetONNXType()));
+    return errorWithCode(ErrorCode::kNotImplemented,
+                         "Non-tensor type {} not supported",
+                         static_cast<int>(type_info.GetONNXType()));
   }
 
   auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
@@ -228,30 +214,43 @@ class MlirGenerator {
         irpa_path_(irpa_path),
         target_config_(std::move(target_config)) {}
 
-  OrtStatus* Generate() {
+  // A single (suffix, dim_specs) variant for MLIR generation.
+  struct VariantInfo {
+    std::string suffix;           // Function name suffix (e.g., "_variant0").
+    const DimSpecVariant* specs;  // Dim specs for this variant.
+  };
+
+  // Generates an MLIR module containing one function per variant.
+  // All functions share the same module (and thus the same parameter
+  // references), so when compiled to a single VMFB the weights are shared.
+  // For the unspecialized case, pass a single variant with empty suffix/specs.
+  // Populates function_names with the MLIR function name for each variant.
+  MaybeError Generate(const std::vector<VariantInfo>& variants,
+                      std::vector<std::string>& function_names) {
     CollectMetadata();
-    OrtStatus* status = EmitModuleHeader();
-    if (status) return status;
-    status = EmitFunctionBody();
-    if (status) return status;
-    EmitModuleFooter();
-    return nullptr;
+    function_names.clear();
+    function_names.reserve(variants.size());
+
+    EmitModulePrologue();
+    for (const auto& v : variants) {
+      ConfigureForVariant(*v.specs, v.suffix);
+      function_names.push_back(graph_name_);
+      IREE_EP_RETURN_IF_ERROR(EmitFunctionHeader());
+      IREE_EP_RETURN_IF_ERROR(EmitFunctionBody());
+      out_ << "  }\n";  // Close function.
+    }
+    out_ << "}\n";  // Close module.
+    return ok();
   }
 
   // Builds an IRPA parameter archive for large initializers and creates a
   // parameter provider. Call after Generate(). If no parameters are needed,
   // the output pointers remain null.
-  OrtStatus* BuildParameterArchive(ParameterIndexPtr& out_index,
+  MaybeError BuildParameterArchive(ParameterIndexPtr& out_index,
                                    ParameterProviderPtr& out_provider);
 
  private:
   void CollectMetadata() {
-    // Get graph name.
-    graph_name_ = SanitizeName(graph_.GetName());
-    if (graph_name_.empty()) {
-      graph_name_ = "main";
-    }
-
     // Get IR version.
     ir_version_ = graph_.GetOnnxIRVersion();
 
@@ -287,32 +286,67 @@ class MlirGenerator {
 
     // Initializers.
     initializers_ = initializers;
+
+    // Identify large initializers that need IRPA parameter backing.
+    for (size_t i = 0; i < initializers_.size(); ++i) {
+      auto tensor_info =
+          initializers_[i].TypeInfo().GetTensorTypeAndShapeInfo();
+      size_t byte_size = tensor_info.GetElementCount() *
+                         OnnxElementTypeSize(tensor_info.GetElementType());
+      if (byte_size > kMaxInlineInitializerSize) {
+        parameter_initializers_.push_back(
+            {SanitizeName(initializers_[i].GetName()), i});
+      }
+    }
+
+    // Collect symbolic dimension names for graph inputs.
+    // These are used for dim spec matching (static specialization and
+    // divisibility constraints).
+    for (const auto& input : graph_inputs_) {
+      if (input.TypeInfo().GetONNXType() != ONNX_TYPE_TENSOR) {
+        input_symbolic_dims_.emplace_back();
+        continue;
+      }
+      input_symbolic_dims_.push_back(
+          input.TypeInfo().GetTensorTypeAndShapeInfo().GetSymbolicDimensions());
+    }
   }
 
-  OrtStatus* EmitModuleHeader() {
-    // Build function arguments.
-    std::ostringstream args;
+  // Configures the generator for a variant (dim specs, function name suffix).
+  // Must be called before EmitFunctionHeader/EmitFunctionBody for each variant.
+  void ConfigureForVariant(const DimSpecVariant& specs,
+                           const std::string& suffix) {
+    // Build constraint lookup: symbolic_name -> DimSpec.
+    constraint_specs_.clear();
+    for (const auto& spec : specs) {
+      constraint_specs_[spec.symbolic_name] = spec;
+    }
+
+    // Determine which inputs have at least one constrained dynamic dim.
+    constrained_inputs_.clear();
     for (size_t i = 0; i < graph_inputs_.size(); ++i) {
-      if (i > 0) {
-        args << ", ";
+      if (graph_inputs_[i].TypeInfo().GetONNXType() != ONNX_TYPE_TENSOR)
+        continue;
+      auto shape =
+          graph_inputs_[i].TypeInfo().GetTensorTypeAndShapeInfo().GetShape();
+      const auto& sym_dims = input_symbolic_dims_[i];
+      for (size_t d = 0; d < shape.size(); ++d) {
+        if (shape[d] < 0 && d < sym_dims.size() && sym_dims[d] &&
+            sym_dims[d][0] != '\0' && constraint_specs_.contains(sym_dims[d])) {
+          constrained_inputs_.insert(i);
+          break;
+        }
       }
-      std::string name = SanitizeName(graph_inputs_[i].GetName());
-      IREE_ORT_ASSIGN_OR_RETURN(std::string type,
-                                FormatTensorType(graph_inputs_[i].TypeInfo()));
-      args << "%" << name << ": " << type;
     }
 
-    // Build return types.
-    std::ostringstream ret_types;
-    for (size_t i = 0; i < graph_outputs_.size(); ++i) {
-      if (i > 0) {
-        ret_types << ", ";
-      }
-      IREE_ORT_ASSIGN_OR_RETURN(std::string ret_type,
-                                FormatTensorType(graph_outputs_[i].TypeInfo()));
-      ret_types << ret_type;
-    }
+    // ONNX allows empty graph names; MLIR functions need a valid name.
+    std::string raw_name = graph_.GetName();
+    graph_name_ = raw_name.empty() ? "main" : SanitizeName(raw_name);
+    graph_name_ += suffix;
+  }
 
+  // Emits the module-level prologue.
+  void EmitModulePrologue() {
     // Define the #executable_target alias for hal.dispatch.extern objects()
     // clauses. This is harmless when no extern dispatches are present.
     // We intentionally do NOT set hal.device.targets on the module — device
@@ -325,6 +359,37 @@ class MlirGenerator {
            << target_config_.target_arch << "\"}>\n";
     }
     out_ << "module {\n";
+  }
+
+  // Emits the function signature with current dim specs and function name.
+  // Constrained input args are renamed to %name__orig so EmitDimConstraints()
+  // can rebind the original name after applying shape assumptions.
+  MaybeError EmitFunctionHeader() {
+    std::ostringstream args;
+    for (size_t i = 0; i < graph_inputs_.size(); ++i) {
+      if (i > 0) {
+        args << ", ";
+      }
+      std::string name = SanitizeName(graph_inputs_[i].GetName());
+      IREE_EP_ASSIGN_OR_RETURN(std::string type,
+                               FormatTensorType(graph_inputs_[i].TypeInfo()));
+      if (constrained_inputs_.contains(i)) {
+        args << "%" << name << "__orig: " << type;
+      } else {
+        args << "%" << name << ": " << type;
+      }
+    }
+
+    // Build return types.
+    std::ostringstream ret_types;
+    for (size_t i = 0; i < graph_outputs_.size(); ++i) {
+      if (i > 0) {
+        ret_types << ", ";
+      }
+      IREE_EP_ASSIGN_OR_RETURN(std::string ret_type,
+                               FormatTensorType(graph_outputs_[i].TypeInfo()));
+      ret_types << ret_type;
+    }
 
     constexpr std::string_view func_schema =
         R"(  func.func @{0}({1}) -> ({2})
@@ -342,21 +407,22 @@ class MlirGenerator {
                         ret_types.str(),  // {2}
                         ir_version_,      // {3}
                         opset_version_);  // {4}
-    return nullptr;
+    return ok();
   }
 
-  OrtStatus* EmitFunctionBody() {
+  MaybeError EmitFunctionBody() {
+    // Emit dim constraints (util.assume.int + flow.tensor.tie_shape).
+    IREE_EP_RETURN_IF_ERROR(EmitDimConstraints());
+
     // Emit initializers as flow.tensor.constant ops.
-    for (size_t i = 0; i < initializers_.size(); ++i) {
-      OrtStatus* status = EmitInitializer(initializers_[i], i);
-      if (status) return status;
+    for (const auto& init : initializers_) {
+      IREE_EP_RETURN_IF_ERROR(EmitInitializer(init));
     }
 
     // Emit nodes.
     auto nodes = graph_.GetNodes();
     for (const auto& node : nodes) {
-      OrtStatus* status = EmitNode(node);
-      if (status) return status;
+      IREE_EP_RETURN_IF_ERROR(EmitNode(node));
     }
 
     // Emit return.
@@ -378,13 +444,12 @@ class MlirGenerator {
   //       #flow.parameter.named<"model"::"name"> : tensor<...>
   //   %name = torch_c.from_builtin_tensor %__raw_name : tensor<...>
   //       -> !torch.vtensor<[...],dtype>
-  OrtStatus* EmitInitializer(const Ort::ConstValueInfo& init,
-                             size_t init_index) {
+  MaybeError EmitInitializer(const Ort::ConstValueInfo& init) {
     std::string name = SanitizeName(init.GetName());
-    IREE_ORT_ASSIGN_OR_RETURN(std::string vtensor_type,
-                              FormatTensorType(init.TypeInfo()));
-    IREE_ORT_ASSIGN_OR_RETURN(std::string tensor_type,
-                              FormatMlirTensorType(init.TypeInfo()));
+    IREE_EP_ASSIGN_OR_RETURN(std::string vtensor_type,
+                             FormatTensorType(init.TypeInfo()));
+    IREE_EP_ASSIGN_OR_RETURN(std::string tensor_type,
+                             FormatMlirTensorType(init.TypeInfo()));
 
     auto tensor_info = init.TypeInfo().GetTensorTypeAndShapeInfo();
     size_t byte_size = tensor_info.GetElementCount() *
@@ -393,10 +458,7 @@ class MlirGenerator {
     if (byte_size <= kMaxInlineInitializerSize) {
       // Small: inline with dense<> DenseElementsAttr.
       Ort::ConstValue tensor_value{nullptr};
-      auto status = init.GetInitializer(tensor_value);
-      if (!status.IsOK()) {
-        return status.release();
-      }
+      IREE_EP_RETURN_IF_ORT_STATUS(init.GetInitializer(tensor_value).release());
       const auto* data =
           static_cast<const uint8_t*>(tensor_value.GetTensorRawData());
       std::string hex = HexEncode(data, tensor_value.GetTensorSizeInBytes());
@@ -413,12 +475,11 @@ class MlirGenerator {
     %{0} = torch_c.from_builtin_tensor %__raw_{0} : {1} -> {2}
 )";
       out_ << std::format(schema, name, tensor_type, vtensor_type);
-      parameter_initializers_.push_back({name, init_index});
     }
-    return nullptr;
+    return ok();
   }
 
-  OrtStatus* EmitNode(const Ort::ConstNode& node) {
+  MaybeError EmitNode(const Ort::ConstNode& node) {
     if (node.GetDomain() == "com.iree" &&
         node.GetOperatorType() == "ExternDispatch") {
       return EmitExternDispatch(node, extern_id_++);
@@ -451,8 +512,8 @@ class MlirGenerator {
       first_output = false;
       valid_output_count++;
       out_names << "%" << SanitizeName(output_name);
-      IREE_ORT_ASSIGN_OR_RETURN(std::string out_type,
-                                FormatTensorType(outputs[i].TypeInfo()));
+      IREE_EP_ASSIGN_OR_RETURN(std::string out_type,
+                               FormatTensorType(outputs[i].TypeInfo()));
       out_types << out_type;
     }
 
@@ -475,13 +536,13 @@ class MlirGenerator {
       }
       first_input = false;
       in_names << "%" << SanitizeName(input_name);
-      IREE_ORT_ASSIGN_OR_RETURN(std::string in_type,
-                                FormatTensorType(inputs[i].TypeInfo()));
+      IREE_EP_ASSIGN_OR_RETURN(std::string in_type,
+                               FormatTensorType(inputs[i].TypeInfo()));
       in_types << in_type;
     }
 
     // Build attributes.
-    IREE_ORT_ASSIGN_OR_RETURN(std::string attr_str, FormatAttributes(attrs));
+    IREE_EP_ASSIGN_OR_RETURN(std::string attr_str, FormatAttributes(attrs));
 
     // Format output types: wrap in parentheses if multiple outputs.
     std::string out_types_str = out_types.str();
@@ -500,7 +561,7 @@ class MlirGenerator {
                         attr_str,         // {3}
                         in_types.str(),   // {4}
                         out_types_str);   // {5}
-    return nullptr;
+    return ok();
   }
 
   ErrorOr<std::string> FormatAttributes(
@@ -550,9 +611,53 @@ class MlirGenerator {
         return std::format("torch.onnx.{0} = [{1}]", name,
                            Join(str_values, ", "));
       }
+      case ORT_OP_ATTR_TENSOR: {
+        Ort::Value tensor_value{nullptr};
+        auto status = attr.GetTensorAttributeAsOrtValue(tensor_value);
+        if (!status.IsOK()) {
+          return error("Failed to read tensor attribute '{}': {}", name,
+                       status.GetErrorMessage());
+        }
+        auto type_info = tensor_value.GetTensorTypeAndShapeInfo();
+        auto shape = type_info.GetShape();
+        auto dtype = type_info.GetElementType();
+        size_t count = type_info.GetElementCount();
+        const auto* raw =
+            static_cast<const uint8_t*>(tensor_value.GetTensorRawData());
+
+        // Only splat (single-element) tensor attributes are supported.
+        // Per the ONNX spec, ConstantOfShape.value is the only TENSOR
+        // attribute that reaches an EP and it is always 1-element.
+        if (count != 1) {
+          return error(
+              "Unsupported tensor attribute '{}': expected 1-element splat, "
+              "got {} elements",
+              name, count);
+        }
+
+        // Format as dense<hex> : tensor<shape x dtype>.
+        // Hex encoding is lossless for all types and matches EmitInitializer.
+        std::string dense = std::format(
+            "dense<\"{}\">", HexEncode(raw, OnnxElementTypeSize(dtype)));
+
+        // Build tensor type using signed integer types (matching
+        // torch.onnx.value format).
+        std::ostringstream type_ss;
+        type_ss << "tensor<";
+        for (size_t j = 0; j < shape.size(); ++j) {
+          type_ss << shape[j] << "x";
+        }
+        IREE_EP_ASSIGN_OR_RETURN(std::string elem_type,
+                                 GetElementType(dtype, /*signless=*/false));
+        type_ss << elem_type << ">";
+
+        return std::format("torch.onnx.{0} = {1} : {2}", name, dense,
+                           type_ss.str());
+      }
       default:
-        return error("Unsupported attribute type {} for '{}'",
-                     static_cast<int>(type), name);
+        return errorWithCode(ErrorCode::kNotImplemented,
+                             "Unsupported attribute type {} for '{}'",
+                             static_cast<int>(type), name);
     }
   }
 
@@ -561,7 +666,7 @@ class MlirGenerator {
   // - "$N" input reference (extracts scalar from input tensor N)
   // as_i32: if true, result is i32; otherwise index.
   // context: used in error messages, e.g. "push_constants[0]".
-  OrtStatus* EmitResolvedValue(
+  MaybeError EmitResolvedValue(
       const std::string& spec, const std::string& result_name, bool as_i32,
       const std::vector<std::string>& raw_input_names,
       const std::vector<std::string>& raw_input_types,
@@ -570,26 +675,30 @@ class MlirGenerator {
     size_t input_idx;
     if (ParseInputRef(spec, input_idx)) {
       if (input_idx >= raw_input_names.size()) {
-        return MakeError(
+        return errorWithCode(
+            ErrorCode::kInvalidArgument,
             "ExternDispatch: {} = '{}' references input[{}] but only {} "
             "inputs available",
             context, spec, input_idx, raw_input_names.size());
       }
       if (raw_input_names[input_idx].empty()) {
-        return MakeError(
+        return errorWithCode(
+            ErrorCode::kInvalidArgument,
             "ExternDispatch: {} = '{}' references input[{}] which is "
             "null or empty",
             context, spec, input_idx);
       }
       if (raw_input_ranks[input_idx] != 0) {
-        return MakeError(
+        return errorWithCode(
+            ErrorCode::kInvalidArgument,
             "ExternDispatch: {} = '{}' references input[{}] which has "
             "rank {} (must be a scalar tensor, rank 0)",
             context, spec, input_idx, raw_input_ranks[input_idx]);
       }
       const std::string& elem_type = raw_input_elem_types[input_idx];
       if (elem_type != "i64" && elem_type != "i32") {
-        return MakeError(
+        return errorWithCode(
+            ErrorCode::kInvalidArgument,
             "ExternDispatch: {} = '{}' references input[{}] with element "
             "type {} (must be i32 or i64)",
             context, spec, input_idx, elem_type);
@@ -618,23 +727,26 @@ class MlirGenerator {
     } else {
       size_t value;
       if (!ParseUnsigned(spec, value)) {
-        return MakeError(
+        return errorWithCode(
+            ErrorCode::kInvalidArgument,
             "ExternDispatch: {} = '{}' is not a valid integer literal "
             "or input reference ($N)",
             context, spec);
       }
       if (as_i32 && value > static_cast<size_t>(INT32_MAX)) {
-        return MakeError("ExternDispatch: {} = '{}' exceeds i32 range (max {})",
-                         context, spec, INT32_MAX);
+        return errorWithCode(
+            ErrorCode::kInvalidArgument,
+            "ExternDispatch: {} = '{}' exceeds i32 range (max {})", context,
+            spec, INT32_MAX);
       }
       out_ << std::format("    %{} = arith.constant {} : {}\n", result_name,
                           spec, as_i32 ? "i32" : "index");
     }
-    return nullptr;
+    return ok();
   }
 
   // Emits a hal.dispatch.extern for a com.iree:ExternDispatch ONNX node.
-  OrtStatus* EmitExternDispatch(const Ort::ConstNode& node, int extern_id) {
+  MaybeError EmitExternDispatch(const Ort::ConstNode& node, int extern_id) {
     std::string prefix = std::format("__extern_{}", extern_id);
     auto inputs = node.GetInputs();
     auto outputs = node.GetOutputs();
@@ -663,38 +775,43 @@ class MlirGenerator {
 
     // Validate backend supports extern dispatch (must have a HAL target).
     if (target_config_.hal_backend.empty()) {
-      return MakeError(
+      return errorWithCode(
+          ErrorCode::kInvalidArgument,
           "ExternDispatch: backend '{}' does not support extern dispatch",
           target_config_.backend);
     }
 
     // Validate required attributes.
     if (kernel_name.empty()) {
-      return MakeError(
-          "ExternDispatch: missing required 'kernel_name' attribute");
+      return errorWithCode(ErrorCode::kInvalidArgument,
+                           "ExternDispatch: missing required 'kernel_name' "
+                           "attribute");
     }
     if (kernel_object.empty()) {
-      return MakeError(
-          "ExternDispatch: missing required 'kernel_object' attribute");
+      return errorWithCode(ErrorCode::kInvalidArgument,
+                           "ExternDispatch: missing required 'kernel_object' "
+                           "attribute");
     }
     if (workgroup_size.size() != 3) {
-      return MakeError(
+      return errorWithCode(
+          ErrorCode::kInvalidArgument,
           "ExternDispatch: 'workgroup_size' must have exactly 3 elements "
           "(X, Y, Z), got {}",
           workgroup_size.size());
     }
     for (size_t i = 0; i < 3; ++i) {
       if (workgroup_size[i] <= 0) {
-        return MakeError(
+        return errorWithCode(
+            ErrorCode::kInvalidArgument,
             "ExternDispatch: workgroup_size[{}] = {} must be positive", i,
             workgroup_size[i]);
       }
     }
     if (workgroup_count.size() != 3) {
-      return MakeError(
-          "ExternDispatch: 'workgroup_count' must have "
-          "exactly 3 elements (X, Y, Z), got {}",
-          workgroup_count.size());
+      return errorWithCode(ErrorCode::kInvalidArgument,
+                           "ExternDispatch: 'workgroup_count' must have "
+                           "exactly 3 elements (X, Y, Z), got {}",
+                           workgroup_count.size());
     }
 
     // Pre-scan push_constants and workgroup_count for $N input references.
@@ -724,15 +841,15 @@ class MlirGenerator {
       if (input_name.empty()) continue;
 
       std::string ssa = SanitizeName(input_name);
-      IREE_ORT_ASSIGN_OR_RETURN(std::string vtensor_type,
-                                FormatTensorType(inputs[i].TypeInfo()));
-      IREE_ORT_ASSIGN_OR_RETURN(std::string tensor_type,
-                                FormatMlirTensorType(inputs[i].TypeInfo()));
+      IREE_EP_ASSIGN_OR_RETURN(std::string vtensor_type,
+                               FormatTensorType(inputs[i].TypeInfo()));
+      IREE_EP_ASSIGN_OR_RETURN(std::string tensor_type,
+                               FormatMlirTensorType(inputs[i].TypeInfo()));
       auto tensor_info = inputs[i].TypeInfo().GetTensorTypeAndShapeInfo();
       std::string raw = std::format("{}_raw_{}", prefix, i);
       raw_input_names[i] = raw;
       raw_input_types[i] = tensor_type;
-      IREE_ORT_ASSIGN_OR_RETURN(
+      IREE_EP_ASSIGN_OR_RETURN(
           raw_input_elem_types[i],
           GetElementType(tensor_info.GetElementType(), /*signless=*/true));
       raw_input_ranks[i] = tensor_info.GetShape().size();
@@ -747,11 +864,10 @@ class MlirGenerator {
     for (size_t i = 0; i < push_constants.size(); ++i) {
       std::string pc = std::format("{}_pc{}", prefix, i);
       pc_names.push_back(pc);
-      OrtStatus* status = EmitResolvedValue(
+      IREE_EP_RETURN_IF_ERROR(EmitResolvedValue(
           push_constants[i], pc, /*as_i32=*/true, raw_input_names,
           raw_input_types, raw_input_elem_types, raw_input_ranks,
-          std::format("push_constants[{}]", i));
-      if (status) return status;
+          std::format("push_constants[{}]", i)));
     }
 
     // Step 3: Compute workload values from workgroup_count[0..2].
@@ -762,11 +878,10 @@ class MlirGenerator {
     for (size_t i = 0; i < 3; ++i) {
       std::string wl = std::format("{}_workload_{}", prefix, i);
       workload_names.push_back(wl);
-      OrtStatus* status = EmitResolvedValue(
+      IREE_EP_RETURN_IF_ERROR(EmitResolvedValue(
           workgroup_count[i], wl, /*as_i32=*/false, raw_input_names,
           raw_input_types, raw_input_elem_types, raw_input_ranks,
-          std::format("workgroup_count[{}]", i));
-      if (status) return status;
+          std::format("workgroup_count[{}]", i)));
     }
 
     // Step 4: Build output names and types.
@@ -782,19 +897,19 @@ class MlirGenerator {
       std::string output_name = outputs[i].GetName();
       if (output_name.empty()) continue;
       out_raw_names.push_back(std::format("{}_out{}", prefix, i));
-      IREE_ORT_ASSIGN_OR_RETURN(std::string raw_type,
-                                FormatMlirTensorType(outputs[i].TypeInfo()));
+      IREE_EP_ASSIGN_OR_RETURN(std::string raw_type,
+                               FormatMlirTensorType(outputs[i].TypeInfo()));
       out_raw_types.push_back(std::move(raw_type));
-      IREE_ORT_ASSIGN_OR_RETURN(std::string vtensor_type,
-                                FormatTensorType(outputs[i].TypeInfo()));
+      IREE_EP_ASSIGN_OR_RETURN(std::string vtensor_type,
+                               FormatTensorType(outputs[i].TypeInfo()));
       out_vtensor_types.push_back(std::move(vtensor_type));
       out_ssa_names.push_back(SanitizeName(output_name));
     }
 
     if (out_raw_names.empty()) {
-      return MakeError(
-          "ExternDispatch: node has no valid outputs (all outputs are "
-          "null or have empty names)");
+      return errorWithCode(ErrorCode::kInvalidArgument,
+                           "ExternDispatch: node has no valid outputs (all "
+                           "outputs are null or have empty names)");
     }
 
     // Step 5: Emit hal.dispatch.extern.
@@ -882,10 +997,10 @@ class MlirGenerator {
           out_ssa_names[i], out_raw_names[i], out_raw_types[i],
           out_vtensor_types[i]);
     }
-    return nullptr;
+    return ok();
   }
 
-  OrtStatus* EmitReturn() {
+  MaybeError EmitReturn() {
     std::ostringstream ret_values;
     std::ostringstream ret_types;
     for (size_t i = 0; i < graph_outputs_.size(); ++i) {
@@ -894,19 +1009,170 @@ class MlirGenerator {
         ret_types << ", ";
       }
       ret_values << "%" << SanitizeName(graph_outputs_[i].GetName());
-      IREE_ORT_ASSIGN_OR_RETURN(std::string ret_type,
-                                FormatTensorType(graph_outputs_[i].TypeInfo()));
+      IREE_EP_ASSIGN_OR_RETURN(std::string ret_type,
+                               FormatTensorType(graph_outputs_[i].TypeInfo()));
       ret_types << ret_type;
     }
 
     out_ << std::format("    return {0} : {1}\n", ret_values.str(),
                         ret_types.str());
-    return nullptr;
+    return ok();
   }
 
-  void EmitModuleFooter() {
-    out_ << "  }\n";
-    out_ << "}\n";
+  // Info about a constrained input's dynamic dimensions.
+  struct DynDimInfo {
+    size_t dim_idx;
+    std::string dim_ssa;        // e.g., %input__d0
+    std::string symbolic_name;  // empty if unconstrained
+  };
+
+  struct InputConstraintInfo {
+    std::string name;
+    std::string vtensor_type;
+    std::string tensor_type;
+    std::vector<DynDimInfo> dynamic_dims;
+  };
+
+  // Canonical assume: one per constrained symbolic dim name.
+  struct CanonicalAssumeInfo {
+    std::string symbolic_name;
+    std::string ssa_name;        // e.g., %batch_assumed
+    std::string source_dim_ssa;  // dim SSA from first occurrence
+    const DimSpec* spec;
+  };
+
+  ErrorOr<std::vector<InputConstraintInfo>> CollectConstrainedInputInfos(
+      std::vector<CanonicalAssumeInfo>& out_canonical_assumes,
+      std::unordered_map<std::string, size_t>& out_assume_index) const {
+    std::vector<InputConstraintInfo> infos;
+    infos.reserve(constrained_inputs_.size());
+
+    for (size_t i = 0; i < graph_inputs_.size(); ++i) {
+      if (!constrained_inputs_.contains(i)) continue;
+
+      InputConstraintInfo info;
+      info.name = SanitizeName(graph_inputs_[i].GetName());
+      IREE_EP_ASSIGN_OR_RETURN(info.vtensor_type,
+                               FormatTensorType(graph_inputs_[i].TypeInfo()));
+      IREE_EP_ASSIGN_OR_RETURN(
+          info.tensor_type, FormatMlirTensorType(graph_inputs_[i].TypeInfo()));
+
+      auto shape =
+          graph_inputs_[i].TypeInfo().GetTensorTypeAndShapeInfo().GetShape();
+      const auto& sym_dims = input_symbolic_dims_[i];
+      for (size_t d = 0; d < shape.size(); ++d) {
+        if (shape[d] >= 0) continue;  // static dim in ONNX model, skip
+
+        std::string sym_name;
+        if (d < sym_dims.size() && sym_dims[d] && sym_dims[d][0] != '\0') {
+          sym_name = sym_dims[d];
+        }
+
+        std::string dim_ssa = std::format("%{}__d{}", info.name, d);
+        info.dynamic_dims.push_back({d, dim_ssa, sym_name});
+
+        auto spec_it = constraint_specs_.find(sym_name);
+        if (sym_name.empty() || spec_it == constraint_specs_.end()) {
+          continue;
+        }
+        if (!out_assume_index.contains(sym_name)) {
+          out_assume_index[sym_name] = out_canonical_assumes.size();
+          out_canonical_assumes.push_back(CanonicalAssumeInfo{
+              sym_name,
+              std::format("%dim_assumed_{}", out_canonical_assumes.size()),
+              dim_ssa, &spec_it->second});
+        }
+      }
+
+      infos.push_back(std::move(info));
+    }
+
+    return infos;
+  }
+
+  void EmitInputDimExtraction(const std::vector<InputConstraintInfo>& infos) {
+    std::unordered_set<size_t> emitted_constants;
+    for (const auto& info : infos) {
+      out_ << std::format(
+          "    %{}__builtin = torch_c.to_builtin_tensor %{}__orig : {} -> {}\n",
+          info.name, info.name, info.vtensor_type, info.tensor_type);
+
+      for (const auto& dim : info.dynamic_dims) {
+        if (!emitted_constants.contains(dim.dim_idx)) {
+          out_ << std::format("    %c{} = arith.constant {} : index\n",
+                              dim.dim_idx, dim.dim_idx);
+          emitted_constants.insert(dim.dim_idx);
+        }
+        out_ << std::format("    {} = tensor.dim %{}__builtin, %c{} : {}\n",
+                            dim.dim_ssa, info.name, dim.dim_idx,
+                            info.tensor_type);
+      }
+    }
+  }
+
+  void EmitCanonicalAssumes(
+      const std::vector<CanonicalAssumeInfo>& canonical_assumes) {
+    for (const auto& assume : canonical_assumes) {
+      if (assume.spec->div > 1) {
+        out_ << std::format(
+            "    {} = util.assume.int {}<umin = {}, umax = {}, udiv = {}> "
+            ": index\n",
+            assume.ssa_name, assume.source_dim_ssa, assume.spec->min,
+            assume.spec->max, assume.spec->div);
+      } else {
+        out_ << std::format(
+            "    {} = util.assume.int {}<umin = {}, umax = {}> : index\n",
+            assume.ssa_name, assume.source_dim_ssa, assume.spec->min,
+            assume.spec->max);
+      }
+    }
+  }
+
+  void EmitTieShapeRebinding(
+      const std::vector<InputConstraintInfo>& infos,
+      const std::vector<CanonicalAssumeInfo>& canonical_assumes,
+      const std::unordered_map<std::string, size_t>& assume_index) {
+    for (const auto& info : infos) {
+      std::ostringstream operands;
+      for (size_t j = 0; j < info.dynamic_dims.size(); ++j) {
+        if (j > 0) operands << ", ";
+        const auto& dim = info.dynamic_dims[j];
+        auto it = assume_index.find(dim.symbolic_name);
+        if (it != assume_index.end()) {
+          operands << canonical_assumes[it->second].ssa_name;
+        } else {
+          operands << dim.dim_ssa;
+        }
+      }
+
+      out_ << std::format(
+          "    %{}__tied = flow.tensor.tie_shape %{}__builtin : {}{{{}}}\n",
+          info.name, info.name, info.tensor_type, operands.str());
+      out_ << std::format(
+          "    %{} = torch_c.from_builtin_tensor %{}__tied : {} -> {}\n",
+          info.name, info.name, info.tensor_type, info.vtensor_type);
+    }
+  }
+
+  // Emits util.assume.int + flow.tensor.tie_shape ops for constrained dims.
+  // Range-only specs (div == 0): util.assume.int with umin, umax.
+  // Range+div specs (div > 0): util.assume.int with umin, umax, udiv.
+  // For a symbolic dim name shared across multiple inputs, a single canonical
+  // assumed SSA value is emitted and reused in all corresponding tie_shape ops.
+  MaybeError EmitDimConstraints() {
+    if (constraint_specs_.empty()) return ok();
+
+    std::vector<CanonicalAssumeInfo> canonical_assumes;
+    std::unordered_map<std::string, size_t> assume_index;
+
+    IREE_EP_ASSIGN_OR_RETURN(auto infos, CollectConstrainedInputInfos(
+                                             canonical_assumes, assume_index));
+    if (infos.empty()) return ok();
+
+    EmitInputDimExtraction(infos);
+    EmitCanonicalAssumes(canonical_assumes);
+    EmitTieShapeRebinding(infos, canonical_assumes, assume_index);
+    return ok();
   }
 
   // Member variables.
@@ -914,7 +1180,10 @@ class MlirGenerator {
   std::ostream& out_;
   std::string irpa_path_;
   TargetConfig target_config_;
-
+  // Lookup map: symbolic_name -> DimSpec for all specs in current variant.
+  std::unordered_map<std::string, DimSpec> constraint_specs_;
+  // Input indices that have at least one constrained dynamic dim.
+  std::unordered_set<size_t> constrained_inputs_;
   std::string graph_name_;
   int64_t ir_version_ = 8;
   int64_t opset_version_ = 17;
@@ -926,6 +1195,8 @@ class MlirGenerator {
 
   // Extern dispatch state.
   int extern_id_ = 0;
+  // Symbolic dimension names per graph input (parallel to graph_inputs_).
+  std::vector<std::vector<const char*>> input_symbolic_dims_;
 };
 
 // Builds an IRPA parameter archive for large initializers.
@@ -941,10 +1212,10 @@ class MlirGenerator {
 //
 // The resulting parameter provider is registered with the IREE session so that
 // the compiled module can resolve #flow.parameter.named references at runtime.
-OrtStatus* MlirGenerator::BuildParameterArchive(
+MaybeError MlirGenerator::BuildParameterArchive(
     ParameterIndexPtr& out_index, ParameterProviderPtr& out_provider) {
   if (parameter_initializers_.empty()) {
-    return nullptr;
+    return ok();
   }
 
   iree_allocator_t allocator = iree_allocator_system();
@@ -953,7 +1224,7 @@ OrtStatus* MlirGenerator::BuildParameterArchive(
   // The tensor data is valid for the duration of this call (we are inside
   // CompileImpl). iree_io_build_parameter_archive copies it to the IRPA file.
   ParameterIndexPtr source_index;
-  IREE_ORT_RETURN_IF_ERROR(
+  IREE_EP_RETURN_IF_IREE_ERROR(
       iree_io_parameter_index_create(allocator, source_index.ForOutput()));
 
   for (const auto& param : parameter_initializers_) {
@@ -963,16 +1234,14 @@ OrtStatus* MlirGenerator::BuildParameterArchive(
     // Note: GetExternalInitializerInfo returns OK with null output for
     // non-external initializers, so we must check both status and pointer.
     Ort::ExternalInitializerInfo ext_info(nullptr);
-    ORT_RETURN_IF_ERROR(init.GetExternalInitializerInfo(ext_info).release());
+    IREE_EP_RETURN_IF_ORT_STATUS(
+        init.GetExternalInitializerInfo(ext_info).release());
     if (ext_info) {
       continue;
     }
 
     Ort::ConstValue tensor(nullptr);
-    auto status = init.GetInitializer(tensor);
-    if (!status.IsOK()) {
-      return MakeError("Failed to get initializer: {}", init.GetName());
-    }
+    IREE_EP_RETURN_IF_ORT_STATUS(init.GetInitializer(tensor).release());
 
     auto* data = const_cast<uint8_t*>(
         static_cast<const uint8_t*>(tensor.GetTensorRawData()));
@@ -980,7 +1249,7 @@ OrtStatus* MlirGenerator::BuildParameterArchive(
 
     FileHandlePtr handle;
     iree_byte_span_t span = {data, static_cast<iree_host_size_t>(size)};
-    IREE_ORT_RETURN_IF_ERROR(iree_io_file_handle_wrap_host_allocation(
+    IREE_EP_RETURN_IF_IREE_ERROR(iree_io_file_handle_wrap_host_allocation(
         IREE_IO_FILE_ACCESS_READ, span,
         iree_io_file_handle_release_callback_null(), allocator,
         handle.ForOutput()));
@@ -992,13 +1261,13 @@ OrtStatus* MlirGenerator::BuildParameterArchive(
     entry.type = IREE_IO_PARAMETER_INDEX_ENTRY_STORAGE_TYPE_FILE;
     entry.storage.file.handle = handle.Get();
     entry.storage.file.offset = 0;
-    IREE_ORT_RETURN_IF_ERROR(
+    IREE_EP_RETURN_IF_IREE_ERROR(
         iree_io_parameter_index_add(source_index.Get(), &entry));
   }
 
   // Build IRPA archive from source index.
   ParameterIndexPtr target_index;
-  IREE_ORT_RETURN_IF_ERROR(
+  IREE_EP_RETURN_IF_IREE_ERROR(
       iree_io_parameter_index_create(allocator, target_index.ForOutput()));
 
   if (iree_io_parameter_index_count(source_index.Get()) > 0) {
@@ -1006,7 +1275,7 @@ OrtStatus* MlirGenerator::BuildParameterArchive(
         IrpaFileOpenCallback,
         const_cast<std::string*>(&irpa_path_),
     };
-    IREE_ORT_RETURN_IF_ERROR(iree_io_build_parameter_archive(
+    IREE_EP_RETURN_IF_IREE_ERROR(iree_io_build_parameter_archive(
         source_index.Get(), target_index.Get(), file_open, 0, allocator));
   }
 
@@ -1015,7 +1284,8 @@ OrtStatus* MlirGenerator::BuildParameterArchive(
     const auto& init = initializers_[param.initializer_index];
 
     Ort::ExternalInitializerInfo ext_info(nullptr);
-    ORT_RETURN_IF_ERROR(init.GetExternalInitializerInfo(ext_info).release());
+    IREE_EP_RETURN_IF_ORT_STATUS(
+        init.GetExternalInitializerInfo(ext_info).release());
     if (!ext_info) {
       continue;
     }
@@ -1025,7 +1295,7 @@ OrtStatus* MlirGenerator::BuildParameterArchive(
     std::filesystem::path model_dir =
         std::filesystem::path(graph_.GetModelPath()).parent_path();
     std::string filepath = (model_dir / ext_info.GetFilePath()).string();
-    IREE_ORT_RETURN_IF_ERROR(iree_io_file_handle_open(
+    IREE_EP_RETURN_IF_IREE_ERROR(iree_io_file_handle_open(
         IREE_IO_FILE_MODE_READ,
         iree_make_string_view(filepath.data(), filepath.size()), allocator,
         ext_handle.ForOutput()));
@@ -1037,19 +1307,19 @@ OrtStatus* MlirGenerator::BuildParameterArchive(
     entry.type = IREE_IO_PARAMETER_INDEX_ENTRY_STORAGE_TYPE_FILE;
     entry.storage.file.handle = ext_handle.Get();
     entry.storage.file.offset = static_cast<uint64_t>(ext_info.GetFileOffset());
-    IREE_ORT_RETURN_IF_ERROR(
+    IREE_EP_RETURN_IF_IREE_ERROR(
         iree_io_parameter_index_add(target_index.Get(), &entry));
   }
 
   ParameterProviderPtr provider;
-  IREE_ORT_RETURN_IF_ERROR(iree_io_parameter_index_provider_create(
+  IREE_EP_RETURN_IF_IREE_ERROR(iree_io_parameter_index_provider_create(
       iree_make_cstring_view("model"), target_index.Get(),
       IREE_IO_PARAMETER_INDEX_PROVIDER_DEFAULT_MAX_CONCURRENT_OPERATIONS,
       allocator, provider.ForOutput()));
 
   out_index = std::move(target_index);
   out_provider = std::move(provider);
-  return nullptr;
+  return ok();
 }
 
 }  // namespace
@@ -1073,27 +1343,33 @@ TargetConfig TargetConfig::Create(const std::string& target_arch,
   return config;
 }
 
-OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& /*ort_api*/,
-                        const std::string& mlir_path,
-                        const std::string& irpa_path,
-                        ParameterIndexPtr& out_index,
-                        ParameterProviderPtr& out_provider,
-                        TargetConfig target_config) {
+MaybeError GenerateMlir(
+    const Ort::ConstGraph& graph, const OrtApi& /*ort_api*/,
+    const std::string& mlir_path, const std::string& irpa_path,
+    const std::vector<std::pair<std::string, DimSpecVariant>>& variants,
+    std::vector<std::string>& out_function_names, ParameterIndexPtr& out_index,
+    ParameterProviderPtr& out_provider, TargetConfig target_config) {
   std::ofstream file(mlir_path);
   if (!file.is_open()) {
-    return MakeError("Failed to open output file: {}", mlir_path);
+    return error("Failed to open output file: {}", mlir_path);
   }
 
   MlirGenerator gen(graph, file, irpa_path, std::move(target_config));
-  OrtStatus* gen_status = gen.Generate();
-  if (gen_status) return gen_status;
+
+  std::vector<MlirGenerator::VariantInfo> infos;
+  infos.reserve(variants.size());
+  for (const auto& [suffix, specs] : variants) {
+    infos.push_back({suffix, &specs});
+  }
+  IREE_EP_RETURN_IF_ERROR(gen.Generate(infos, out_function_names));
 
   file.close();
   if (file.fail()) {
-    return MakeError("Failed to write to file: {}", mlir_path);
+    return error("Failed to write to file: {}", mlir_path);
   }
 
-  return gen.BuildParameterArchive(out_index, out_provider);
+  IREE_EP_RETURN_IF_ERROR(gen.BuildParameterArchive(out_index, out_provider));
+  return ok();
 }
 
 }  // namespace onnxruntime::iree

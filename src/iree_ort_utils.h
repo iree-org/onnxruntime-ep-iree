@@ -6,8 +6,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Provides element type mapping between ONNX and IREE, and buffer/tensor
-// conversion utilities for data transfer between ORT and IREE runtime.
+// Error conversion utilities between OrtStatus*, iree_status_t, and the
+// internal ErrorObject/ErrorCode types; element type mapping between ONNX and
+// IREE; and buffer/tensor conversion for data transfer between ORT and IREE.
 //
 //===----------------------------------------------------------------------===//
 
@@ -28,7 +29,7 @@ namespace onnxruntime::iree {
 // Error Helpers
 // ============================================================================
 
-// Creates an ORT error status. Accepts std::format arguments directly.
+// Creates an ORT error status with ORT_FAIL. Accepts std::format arguments.
 // Usage: return MakeError("expected {}, got {}", expected, actual);
 template <typename... Args>
 OrtStatus* MakeError(std::format_string<Args...> fmt, Args&&... args) {
@@ -37,19 +38,124 @@ OrtStatus* MakeError(std::format_string<Args...> fmt, Args&&... args) {
       .release();
 }
 
-#define IREE_ORT_ASSIGN_OR_RETURN_IMPL(tmp, varDecl, expr)          \
-  auto tmp = (expr);                                                \
-  if (isError(tmp)) return MakeError("{}", tmp.getError().message); \
-  varDecl = std::move(*tmp)
+// Maps OrtErrorCode to the nearest internal ErrorCode. This mapping is
+// semantic and deliberately lossy: distinct ORT codes may collapse to the same
+// category (e.g. ORT_INVALID_GRAPH -> kInvalidArgument). That is intentional;
+// see the ErrorCode comment in support.h.
+inline ErrorCode FromOrtErrorCode(OrtErrorCode code) {
+  switch (code) {
+    case ORT_INVALID_ARGUMENT:
+    case ORT_INVALID_PROTOBUF:
+    case ORT_INVALID_GRAPH:
+      return ErrorCode::kInvalidArgument;
+    case ORT_NOT_FOUND:
+    case ORT_NO_MODEL:  // model not loaded, not a file-system error
+      return ErrorCode::kNotFound;
+    case ORT_NO_SUCHFILE:
+      return ErrorCode::kNoSuchFile;
+    case ORT_NOT_IMPLEMENTED:
+      return ErrorCode::kNotImplemented;
+    default:
+      return ErrorCode::kUnknown;
+  }
+}
 
-// Evaluates `expr` (which must return ErrorOr<T>), propagates the error as
-// OrtStatus* if in error state, otherwise binds the value to `varDecl`.
+// Maps internal ErrorCode to OrtErrorCode. Only called at the ORT boundary.
+inline OrtErrorCode ToOrtErrorCode(ErrorCode code) {
+  switch (code) {
+    case ErrorCode::kInvalidArgument:
+      return ORT_INVALID_ARGUMENT;
+    case ErrorCode::kNotFound:
+      return ORT_NOT_FOUND;
+    case ErrorCode::kNoSuchFile:
+      return ORT_NO_SUCHFILE;
+    case ErrorCode::kNotImplemented:
+      return ORT_NOT_IMPLEMENTED;
+    default:
+      return ORT_FAIL;
+  }
+}
+
+// Converts an ErrorObject to OrtStatus*, preserving error category.
+inline OrtStatus* ToOrtStatus(const ErrorObject& err) {
+  return Ort::Status(err.message.c_str(), ToOrtErrorCode(err.code)).release();
+}
+
+// Converts an Ort::Status to ErrorObject, consuming the status.
+// Only call when !status.IsOK().
+inline ErrorObject OrtStatusToErrorObject(Ort::Status status) {
+  return ErrorObject{status.GetErrorMessage(),
+                     FromOrtErrorCode(status.GetErrorCode())};
+}
+
+// Converts an iree_status_t to ErrorObject, consuming the status.
+inline ErrorObject IreeStatusToErrorObject(iree_status_t status) {
+  iree_allocator_t allocator = iree_allocator_system();
+  char* buf = nullptr;
+  iree_host_size_t buf_size = 0;
+  iree_status_to_string(status, &allocator, &buf, &buf_size);
+  std::string message = buf ? std::string(buf, buf_size) : "Unknown IREE error";
+  if (buf) {
+    iree_allocator_free(allocator, buf);
+  }
+  iree_status_code_t code = iree_status_code(status);
+  iree_status_ignore(status);
+  // Map IREE status codes to the nearest internal ErrorCode.
+  ErrorCode error_code = ErrorCode::kUnknown;
+  switch (code) {
+    case IREE_STATUS_INVALID_ARGUMENT:
+    case IREE_STATUS_OUT_OF_RANGE:
+      error_code = ErrorCode::kInvalidArgument;
+      break;
+    case IREE_STATUS_NOT_FOUND:
+      error_code = ErrorCode::kNoSuchFile;
+      break;
+    case IREE_STATUS_UNIMPLEMENTED:
+      error_code = ErrorCode::kNotImplemented;
+      break;
+    default:
+      break;
+  }
+  return ErrorObject{std::move(message), error_code};
+}
+
+// Evaluates `expr` (which must return iree_status_t), propagates the error as
+// MaybeError if in error state. For use in MaybeError-returning functions.
+//
+// Usage (in a function returning MaybeError):
+//   IREE_EP_RETURN_IF_IREE_ERROR(iree_fn(...));
+#define IREE_EP_RETURN_IF_IREE_ERROR(expr)     \
+  do {                                         \
+    iree_status_t _iree_s = (expr);            \
+    if (!iree_status_is_ok(_iree_s)) {         \
+      return IreeStatusToErrorObject(_iree_s); \
+    }                                          \
+  } while (0)
+
+// Evaluates `expr` (which must return OrtStatus*), propagates the error as
+// MaybeError if non-null. For use in MaybeError-returning functions at points
+// that call ORT APIs returning OrtStatus*.
+//
+// Usage (in a function returning MaybeError):
+//   IREE_EP_RETURN_IF_ORT_STATUS(ort_fn(...).release());
+#define IREE_EP_RETURN_IF_ORT_STATUS(expr)                \
+  do {                                                    \
+    if (OrtStatus* _ort_s = (expr))                       \
+      return OrtStatusToErrorObject(Ort::Status(_ort_s)); \
+  } while (0)
+
+// Evaluates `expr` (which must return MaybeError), converts and returns as
+// OrtStatus* if in error state. For use in OrtStatus*-returning functions at
+// the ORT API boundary.
 //
 // Usage (in a function returning OrtStatus*):
-//   IREE_ORT_ASSIGN_OR_RETURN(std::string s, FormatAttribute(attr));
-#define IREE_ORT_ASSIGN_OR_RETURN(varDecl, expr)                              \
-  IREE_ORT_ASSIGN_OR_RETURN_IMPL(IREE_EP_CONCAT(_iree_ort_err_or_, __LINE__), \
-                                 varDecl, expr)
+//   IREE_ORT_RETURN_IF_MAYBE_ERROR(GenerateMlir(...));
+#define IREE_ORT_RETURN_IF_MAYBE_ERROR(expr)         \
+  do {                                               \
+    auto _iree_ort_err_ = (expr);                    \
+    if (isError(_iree_ort_err_))                     \
+      return ToOrtStatus(_iree_ort_err_.getError()); \
+  } while (0)
 
 // ============================================================================
 // Element Type Mapping
@@ -123,6 +229,19 @@ std::vector<int64_t> GetBufferViewShape(iree_hal_buffer_view_t* buffer_view);
 // Calculates total byte size from shape and element type.
 size_t CalculateTensorByteSize(const std::vector<int64_t>& shape,
                                ONNXTensorElementDataType element_type);
+
+// ============================================================================
+// Name Sanitization
+// ============================================================================
+
+// Sanitizes an ONNX name to be a valid MLIR SSA identifier.
+// MLIR identifiers must match [a-zA-Z_][a-zA-Z0-9_$]*.
+// Uses '$' as an escape delimiter with hex encoding so the mapping is
+// injective. Alphanumerics and '_' pass through unchanged. '$' itself,
+// leading digits, and all other characters are escaped as $XX$.
+// Examples: "input-1" -> "input$2D$1", "input_1" -> "input_1",
+//           "0abc" -> "$30$abc".
+std::string SanitizeName(const std::string& name);
 
 }  // namespace onnxruntime::iree
 
