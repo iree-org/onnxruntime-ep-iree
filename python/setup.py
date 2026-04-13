@@ -11,16 +11,29 @@ from setuptools.command.build_py import build_py as _build_py
 
 SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
 SOURCE_DIR = SCRIPT_DIR.parent
-# Keep packaging-owned builds in a single stable location so editable installs,
-# wheel builds, and runtime library lookup all agree on where the native
-# artifact lives.
 DEFAULT_BUILD_DIR = SOURCE_DIR / "build" / "cmake" / "default"
+TRACY_BUILD_DIR = SOURCE_DIR / "build" / "cmake" / "tracy"
 CMAKE_EXE = os.environ.get("ONNXRUNTIME_EP_IREE_CMAKE", "cmake")
+ENABLE_TRACY = os.environ.get("ONNXRUNTIME_EP_IREE_ENABLE_TRACING", "").upper() in (
+    "1",
+    "ON",
+    "TRUE",
+)
+SELECTOR_PACKAGE = "onnxruntime_ep_iree"
+DEFAULT_PACKAGE = "onnxruntime_ep_iree_default"
+TRACY_PACKAGE = "onnxruntime_ep_iree_tracy"
 LIB_NAMES = [
     "libonnxruntime_ep_iree.dylib",
     "libonnxruntime_ep_iree.so",
     "onnxruntime_ep_iree.dll",
 ]
+REL_SOURCE_DIR = pathlib.Path(os.path.relpath(SOURCE_DIR, SCRIPT_DIR))
+REL_DEFAULT_PYTHON_DIR = pathlib.Path(
+    os.path.relpath(DEFAULT_BUILD_DIR / "python", SCRIPT_DIR)
+)
+REL_TRACY_PYTHON_DIR = pathlib.Path(
+    os.path.relpath(TRACY_BUILD_DIR / "python", SCRIPT_DIR)
+)
 
 
 def add_env_cmake_setting(
@@ -50,6 +63,13 @@ def maybe_nuke_cmake_cache(build_dir: pathlib.Path) -> str:
     return ninja_path
 
 
+def ensure_built_package(package_root: pathlib.Path) -> None:
+    package_root.mkdir(parents=True, exist_ok=True)
+    init_file = package_root / "__init__.py"
+    if not init_file.exists():
+        init_file.write_text("")
+
+
 def find_library(root_dir: pathlib.Path) -> pathlib.Path:
     candidates = []
     # CMake install layouts differ slightly across platforms and generators, so
@@ -75,9 +95,12 @@ def find_library(root_dir: pathlib.Path) -> pathlib.Path:
     return unique_candidates[0]
 
 
-def build_native_extension() -> pathlib.Path:
-    build_dir = DEFAULT_BUILD_DIR.resolve()
+def build_native_extension(
+    build_dir: pathlib.Path, extra_cmake_args: list[str] | None = None
+) -> pathlib.Path:
+    build_dir = build_dir.resolve()
     stage_dir = build_dir / "python-install"
+    extra_cmake_args = extra_cmake_args or []
     build_type = os.environ.get("ONNXRUNTIME_EP_IREE_CMAKE_BUILD_TYPE", "Release")
     generator = os.environ.get("CMAKE_GENERATOR", "Ninja")
     build_dir.mkdir(parents=True, exist_ok=True)
@@ -109,6 +132,7 @@ def build_native_extension() -> pathlib.Path:
     add_env_cmake_setting(
         cmake_args, "ONNXRUNTIME_EP_IREE_CXX_COMPILER", "CMAKE_CXX_COMPILER"
     )
+    cmake_args.extend(extra_cmake_args)
 
     subprocess.check_call([CMAKE_EXE] + cmake_args)
     subprocess.check_call(
@@ -128,11 +152,33 @@ def build_native_extension() -> pathlib.Path:
     return find_library(stage_dir)
 
 
+def copy_built_library(
+    built_library: pathlib.Path, package_root: pathlib.Path, build_py: _build_py
+) -> None:
+    ensure_built_package(package_root)
+    wheel_target_dir = pathlib.Path(build_py.build_lib) / package_root.name
+    wheel_target_dir.mkdir(parents=True, exist_ok=True)
+    for directory in [package_root, wheel_target_dir]:
+        for pattern in ("*.so", "*.dylib", "*.dll"):
+            for candidate in directory.glob(pattern):
+                candidate.unlink()
+        shutil.copyfile(built_library, directory / built_library.name)
+
+
 class CMakeBuildPy(_build_py):
     def run(self):
         super().run()
         try:
-            built_library = build_native_extension()
+            default_package_root = DEFAULT_BUILD_DIR / "python" / DEFAULT_PACKAGE
+            default_library = build_native_extension(DEFAULT_BUILD_DIR)
+            copy_built_library(default_library, default_package_root, self)
+            if ENABLE_TRACY:
+                tracy_package_root = TRACY_BUILD_DIR / "python" / TRACY_PACKAGE
+                tracy_library = build_native_extension(
+                    TRACY_BUILD_DIR,
+                    ["-DONNXRUNTIME_EP_IREE_ENABLE_TRACING=ON"],
+                )
+                copy_built_library(tracy_library, tracy_package_root, self)
         except subprocess.CalledProcessError:
             # Editable installs route through setuptools, which otherwise tends
             # to collapse native build failures into a generic packaging error.
@@ -141,14 +187,6 @@ class CMakeBuildPy(_build_py):
             print("Native build failed:")
             traceback.print_exc()
             sys.exit(1)
-        target_dir = pathlib.Path(self.build_lib) / "onnxruntime_ep_iree"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        # Wheels should contain exactly the freshly staged EP library and not a
-        # leftover artifact from a previous platform or build configuration.
-        for pattern in ("*.so", "*.dylib", "*.dll"):
-            for candidate in target_dir.glob(pattern):
-                candidate.unlink()
-        shutil.copyfile(built_library, target_dir / built_library.name)
 
 
 # ---------------------------------------------------------------------------
@@ -163,22 +201,27 @@ class BinaryDistribution(Distribution):
         return True
 
 
+ensure_built_package(DEFAULT_BUILD_DIR / "python" / DEFAULT_PACKAGE)
+if ENABLE_TRACY:
+    ensure_built_package(TRACY_BUILD_DIR / "python" / TRACY_PACKAGE)
+
 setup(
     name="onnxruntime-ep-iree",
     version="0.1.0",
     description="Python helpers for the IREE ONNX Runtime Execution Provider",
-    packages=["onnxruntime_ep_iree"],
+    packages=[SELECTOR_PACKAGE, DEFAULT_PACKAGE]
+    + ([TRACY_PACKAGE] if ENABLE_TRACY else []),
+    package_dir={
+        SELECTOR_PACKAGE: SELECTOR_PACKAGE,
+        DEFAULT_PACKAGE: str(REL_DEFAULT_PYTHON_DIR / DEFAULT_PACKAGE),
+        **(
+            {TRACY_PACKAGE: str(REL_TRACY_PYTHON_DIR / TRACY_PACKAGE)}
+            if ENABLE_TRACY
+            else {}
+        ),
+    },
     cmdclass={
         "build_py": CMakeBuildPy,
-    },
-    # Include only the packaged EP shared library so stale local artifacts do
-    # not leak into wheels.
-    package_data={
-        "onnxruntime_ep_iree": [
-            "libonnxruntime_ep_iree.dylib",
-            "libonnxruntime_ep_iree.so",
-            "onnxruntime_ep_iree.dll",
-        ],
     },
     include_package_data=False,
     distclass=BinaryDistribution,

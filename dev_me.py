@@ -5,21 +5,17 @@ First-time usage:
   rm -rf build
   python dev_me.py [--cmake=/path/to/cmake] [--clang=/path/to/clang] \
     [--onnxruntime=/path/to/onnxruntime] [--iree=/path/to/iree] \
-    [--build-type=Debug]
+    [--build-type=Debug] [--no-tracing]
 
 Subsequent usage:
   python dev_me.py
 
 This configures an editable install of the Python package into the active
 Python environment using the package-owned build directory under
-``build/cmake/default``. If one or more configured build directories already
-exist under ``build/cmake/``, rerunning this script performs incremental
-rebuilds instead of reconfiguring.
-
-Today the Python packaging flow only builds the default variant. The rebuild
-path intentionally discovers every configured directory under ``build/cmake/``
-so future variants such as tracy can be added without changing the developer
-workflow.
+``build/cmake/default`` and, by default, also under ``build/cmake/tracy``.
+If one or more configured build directories already exist under
+``build/cmake/``, rerunning this script performs incremental rebuilds instead
+of reconfiguring.
 """
 
 from __future__ import annotations
@@ -242,6 +238,7 @@ def has_configure_overrides(args: argparse.Namespace) -> bool:
             args.clang is not None,
             args.onnxruntime is not None,
             args.iree is not None,
+            args.no_tracing,
             args.build_type != DEFAULT_BUILD_TYPE,
         )
     )
@@ -255,6 +252,7 @@ def configure_mode(env_info: EnvInfo, args: argparse.Namespace) -> None:
     env_vars = {
         "ONNXRUNTIME_EP_IREE_CMAKE": env_info.cmake_exe,
         "ONNXRUNTIME_EP_IREE_CMAKE_BUILD_TYPE": args.build_type,
+        "ONNXRUNTIME_EP_IREE_ENABLE_TRACING": "OFF" if args.no_tracing else "ON",
     }
     if env_info.onnxruntime_dir:
         env_vars["ONNXRUNTIME_SOURCE_DIR"] = env_info.onnxruntime_dir
@@ -313,9 +311,7 @@ def build_mode(env_info: EnvInfo, args: argparse.Namespace) -> None:
         configure_mode(env_info, args)
         return
 
-    # Rebuild every configured variant under build/cmake/. Today that is just
-    # "default", but keeping the loop means future variants like "tracy" slot
-    # into the developer workflow without changing this entrypoint.
+    # Rebuild every configured variant under build/cmake/.
     for build_dir in env_info.configured_dirs:
         print(f"Building {build_dir.relative_to(env_info.this_dir)}")
         subprocess.check_call(
@@ -338,6 +334,11 @@ def main(argv: list[str]) -> None:
         "--build-type",
         default=DEFAULT_BUILD_TYPE,
         help=f"CMake build type (default: {DEFAULT_BUILD_TYPE})",
+    )
+    parser.add_argument(
+        "--no-tracing",
+        action="store_true",
+        help="Disable the Tracy package variant during initial configure",
     )
     args = parser.parse_args(argv)
 

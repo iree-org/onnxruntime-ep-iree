@@ -14,7 +14,9 @@
 
 #include <memory>
 #include <mutex>
+#include <string>
 
+#include "iree/base/tracing.h"
 #include "iree_allocator.h"
 #include "iree_compile.h"
 #include "iree_data_transfer.h"
@@ -76,6 +78,11 @@ IreeEpFactory::IreeEpFactory(const char* ep_name, ApiPtrs apis,
       ApiPtrs(apis),
       logger_(default_logger),
       ep_name_(ep_name) {
+  IREE_TRACE_APP_ENTER();
+  const std::string trace_app_info =
+      std::string("onnxruntime-ep-iree ") + kEpVersion;
+  IREE_TRACE_SET_APP_INFO(trace_app_info.data(), trace_app_info.size());
+
   // Set ORT version we support.
   ort_version_supported = ORT_API_VERSION;
 
@@ -134,6 +141,8 @@ IreeEpFactory::~IreeEpFactory() {
   for (size_t i = 0; i < hw_devices_.size(); ++i) {
     ep_api.ReleaseHardwareDevice(hw_devices_[i]);
   }
+
+  IREE_TRACE_APP_EXIT(0);
 }
 
 iree_hal_device_t* IreeEpFactory::GetDeviceForId(uint32_t device_id) {

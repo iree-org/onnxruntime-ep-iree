@@ -81,6 +81,11 @@ endif()
 # runtime at this source ref.
 set(IREE_GIT_TAG "v3.10.0")
 set(IREE_SOURCE_DIR "" CACHE FILEPATH "Path to IREE source")
+option(
+  ONNXRUNTIME_EP_IREE_ENABLE_TRACING
+  "Enable IREE runtime tracing and fetch Tracy when needed"
+  OFF
+)
 
 # Set IREE build flags.
 set(IREE_VISIBILITY_HIDDEN ON)
@@ -103,6 +108,16 @@ if(NOT APPLE)
   set(IREE_HAL_DRIVER_VULKAN ON)
 endif()
 
+if(ONNXRUNTIME_EP_IREE_ENABLE_TRACING)
+  set(IREE_ENABLE_RUNTIME_TRACING ON)
+  # Shared-library builds can emit Tracy events before Tracy itself is fully
+  # initialized. Use the same delayed-init workaround that shortfin applies.
+  set(TRACY_DELAYED_INIT ON CACHE BOOL "Enable delayed init for tracy")
+  # The EP is loaded and unloaded as a plugin, so it must explicitly own
+  # Tracy startup/shutdown instead of relying on process-lifetime teardown.
+  set(TRACY_MANUAL_LIFETIME ON CACHE BOOL "Enable manual lifetime for tracy")
+endif()
+
 if(IREE_SOURCE_DIR)
   message(STATUS "Using existing IREE sources: ${IREE_SOURCE_DIR}")
   # Normalize so downstream code can use iree_SOURCE_DIR unconditionally
@@ -120,6 +135,9 @@ else()
   # Add vulkan_headers submodule only if Vulkan driver is enabled.
   if(IREE_HAL_DRIVER_VULKAN)
     list(APPEND IREE_SUBMODULES "third_party/vulkan_headers")
+  endif()
+  if(ONNXRUNTIME_EP_IREE_ENABLE_TRACING)
+    list(APPEND IREE_SUBMODULES "third_party/tracy")
   endif()
   FetchContent_Declare(
     iree
@@ -304,6 +322,7 @@ message(STATUS "IREE ONNX Execution Provider Configuration")
 message(STATUS "========================================")
 message(STATUS "  C++ Standard:        ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Build Type:          ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Tracy Enabled:       ${ONNXRUNTIME_EP_IREE_ENABLE_TRACING}")
 message(STATUS "  ONNX Runtime Source: ${IREE_EP_ONNX_SRC_DIR}")
 message(STATUS "  IREE Source:         ${IREE_SOURCE_DIR}")
 message(STATUS "  Install Prefix:      ${CMAKE_INSTALL_PREFIX}")

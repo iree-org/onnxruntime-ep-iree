@@ -22,8 +22,9 @@ pip install ./python
 This runs CMake as part of the package build and places the native build tree in
 `build/cmake/default` by default.
 
-Today this path only packages the default variant. The entrypoint is intended to
-grow a tracing variant later without changing the install command.
+Set `ONNXRUNTIME_EP_IREE_ENABLE_TRACING=ON` to also build and package the Tracy
+variant alongside the default one. Select the runtime in Python with
+`ONNXRUNTIME_EP_IREE_PY_RUNTIME=default` or `tracy`.
 
 To get the shared library path after installation, run:
 
@@ -96,14 +97,13 @@ Useful overrides:
 Behavior:
 
 - On the first run, `dev_me.py` performs `pip install --no-build-isolation -e ./python`
-  and configures the package-owned build tree under `build/cmake/default`.
+  and configures the package-owned build tree under `build/cmake/default`, and
+  also `build/cmake/tracy` unless `--no-tracing` is passed.
 - On later runs, `dev_me.py` performs incremental rebuilds of every configured
   build directory under `build/cmake/`.
 - Delete `build/` to start over with a fresh configuration.
-
-Today this path only creates the default editable build. The rebuild path is
-already structured so future variants such as tracy will rebuild automatically
-once we add them.
+- Select the Tracy-enabled editable runtime with
+  `ONNXRUNTIME_EP_IREE_PY_RUNTIME=tracy`.
 
 5. Run sample test
 
