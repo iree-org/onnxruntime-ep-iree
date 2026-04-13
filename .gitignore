@@ -3,6 +3,7 @@
 
 # Build directories
 build/
+dist/
 cmake-build-*/
 
 # IDE and editor files
@@ -33,6 +34,7 @@ __pycache__/
 venv/
 .venv/
 env/
+.env/
 
 # Jupyter
 .ipynb_checkpoints

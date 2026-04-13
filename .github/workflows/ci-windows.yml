@@ -22,18 +22,10 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt numpy
-
-      - name: CMake - configure
-        run: cmake -G Ninja -B ${{ env.BUILD_DIR }} -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
-
-      - name: CMake - build
-        run: cmake --build ${{ env.BUILD_DIR }}
+        run: pip install -r requirements-dev.txt
 
       - name: Install Python package
-        run: |
-          $env:ONNXRUNTIME_EP_IREE_BUILD_DIR = "${{ github.workspace }}\${{ env.BUILD_DIR }}"
-          pip install python/
+        run: pip install .\python
 
       - name: Run tests
         run: pytest test/ -v

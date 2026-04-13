@@ -32,32 +32,32 @@ def get_library_path() -> str:
     """Return the absolute path to the native IREE EP shared library.
 
     Lookup order:
-      1. The project's ``build/`` directory, found by walking up from this package's
-         location (``python/onnxruntime_ep_iree/ -> python/ -> project_root/ -> build/``).
-         This is the primary path for editable installs — it always points to the
-         latest build output, even after the C++ library is rebuilt.
+      1. The packaging build directory (``<project_root>/build/cmake/default``),
+         which is where ``pip install`` / ``pip wheel`` builds the shared library.
       2. The package directory itself (for wheel-based installs where the library
          was bundled into the package).
 
     Raises ``FileNotFoundError`` if the library cannot be found in either location.
     """
     pkg_dir = Path(__file__).parent
-
-    # 1. Check the project build directory (editable installs).
-    #    Layout: <project_root>/python/onnxruntime_ep_iree/__init__.py
     project_root = pkg_dir.parent.parent
-    result = _find_lib_in(project_root / "build")
+
+    # Editable installs import Python from the source tree, so the native EP is
+    # resolved from the packaging-owned build tree instead of site-packages.
+    result = _find_lib_in(project_root / "build" / "cmake" / "default")
     if result:
         return result
 
-    # 2. Check the package directory (wheel installs).
+    # Wheel installs bundle the shared library directly into the package.
     result = _find_lib_in(pkg_dir)
     if result:
         return result
 
     raise FileNotFoundError(
         "IREE EP library not found. "
-        "Make sure the C++ library has been built (cmake -B build -GNinja && ninja -C build)."
+        "Build the package with `pip install ./python` or "
+        "`pip wheel -w dist ./python`. For editable installs, build the native library in "
+        "`build/cmake/default`."
     )
 
 

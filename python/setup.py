@@ -1,68 +1,154 @@
-"""Setup script for the onnxruntime-ep-iree Python package.
-
-Currently, we use ONNXRUNTIME_EP_IREE_BUILD_DIR to specify the build directory used by
-the developer to built the library. The library is built externally via cmake
-and not by this setup script. It is only required at install time, not at
-runtime. For editable installs, setup.py only validates the setup.py exists in
-the build directory, it doesn't copy or generate any files. At runtime,
-``get_library_path()`` finds the library by walking up from the package's
-source location to ``<project_root>/build/``. This means rebuilds are picked up
-immediately without reinstalling. For wheel builds (``pip wheel`` / ``pip
-install``), setup.py copies the library into the package directory so it is
-bundled in the wheel.
-
-Note that this is a very temporary setup. We are never going to ship like this.
-The only reason we started out like this is because before this we were hardcoding
-library paths, which didn't work when trying to develop the library on macos
-vs linux (.dylib vs .so). We will eventually probably do something similar to
-shortfin, where we have a devme.py file to get things setup for dev workflow,
-and let the setup.py build a normal build and a tracy enabled build.
-"""
-
 import os
 import pathlib
 import shutil
+import subprocess
+import sys
+import traceback
 
 from setuptools import Distribution, setup
+from setuptools.command.build_py import build_py as _build_py
 
-script_dir = pathlib.Path(__file__).parent.resolve()
 
-# ---------------------------------------------------------------------------
-# Locate the pre-built native library via environment variable.
-# ---------------------------------------------------------------------------
-build_dir = os.environ.get("ONNXRUNTIME_EP_IREE_BUILD_DIR")
-if not build_dir:
-    raise EnvironmentError(
-        "ONNXRUNTIME_EP_IREE_BUILD_DIR environment variable must be set to the "
-        "directory containing the built libonnxruntime_ep_iree shared library."
-    )
-
-build_dir = pathlib.Path(build_dir).resolve()
-
-# Find the library in the build directory.
-lib_names = [
+SCRIPT_DIR = pathlib.Path(__file__).parent.resolve()
+SOURCE_DIR = SCRIPT_DIR.parent
+# Keep packaging-owned builds in a single stable location so editable installs,
+# wheel builds, and runtime library lookup all agree on where the native
+# artifact lives.
+DEFAULT_BUILD_DIR = SOURCE_DIR / "build" / "cmake" / "default"
+CMAKE_EXE = os.environ.get("ONNXRUNTIME_EP_IREE_CMAKE", "cmake")
+LIB_NAMES = [
     "libonnxruntime_ep_iree.dylib",
     "libonnxruntime_ep_iree.so",
     "onnxruntime_ep_iree.dll",
 ]
-found = [build_dir / name for name in lib_names if (build_dir / name).exists()]
-if len(found) != 1:
-    raise FileNotFoundError(
-        f"Expected exactly one EP library in {build_dir}, "
-        f"found: {[str(p) for p in found]}"
-    )
-ep_lib_path = found[0]
 
-# ---------------------------------------------------------------------------
-# For non-editable installs, copy the library into the package so it gets
-# bundled into the wheel.  For editable installs this copy is unnecessary
-# (get_library_path() finds it via relative path), but it's harmless and
-# keeps setup.py simple — no need to detect which install mode we're in.
-# ---------------------------------------------------------------------------
-pkg_dir = script_dir / "onnxruntime_ep_iree"
-dst = pkg_dir / ep_lib_path.name
-if dst.resolve() != ep_lib_path.resolve():
-    shutil.copyfile(ep_lib_path, dst)
+
+def add_env_cmake_setting(
+    args: list[str], env_name: str, cmake_name: str | None = None
+):
+    value = os.getenv(env_name)
+    if value:
+        args.append(f"-D{cmake_name or env_name}={value}")
+
+
+def maybe_nuke_cmake_cache(build_dir: pathlib.Path) -> str:
+    ninja_path = shutil.which("ninja") or ""
+    # PEP 517/660 builds can run under different virtualenvs or isolated build
+    # environments across invocations. CMake caches both the Python executable
+    # and the Ninja path, so preserve a tiny stamp and invalidate the cache when
+    # either one changes underneath an existing build tree.
+    expected_stamp = f"{sys.executable}\n{ninja_path}"
+    stamp_file = build_dir / "python_stamp.txt"
+    if stamp_file.exists() and stamp_file.read_text() == expected_stamp:
+        return ninja_path
+
+    cmake_cache = build_dir / "CMakeCache.txt"
+    if cmake_cache.exists():
+        cmake_cache.unlink()
+
+    stamp_file.write_text(expected_stamp)
+    return ninja_path
+
+
+def find_library(root_dir: pathlib.Path) -> pathlib.Path:
+    candidates = []
+    # CMake install layouts differ slightly across platforms and generators, so
+    # search the common staging locations and require a single unambiguous EP
+    # library before packaging it.
+    for directory in [
+        root_dir,
+        root_dir / "lib",
+        root_dir / "bin",
+        root_dir / "Release",
+        root_dir / "Debug",
+    ]:
+        for lib_name in LIB_NAMES:
+            lib_path = directory / lib_name
+            if lib_path.exists():
+                candidates.append(lib_path)
+    unique_candidates = sorted(set(candidates), key=str)
+    if len(unique_candidates) != 1:
+        raise FileNotFoundError(
+            f"Expected exactly one EP library under {root_dir}, "
+            f"found: {[str(path) for path in unique_candidates]}"
+        )
+    return unique_candidates[0]
+
+
+def build_native_extension() -> pathlib.Path:
+    build_dir = DEFAULT_BUILD_DIR.resolve()
+    stage_dir = build_dir / "python-install"
+    build_type = os.environ.get("ONNXRUNTIME_EP_IREE_CMAKE_BUILD_TYPE", "Release")
+    generator = os.environ.get("CMAKE_GENERATOR", "Ninja")
+    build_dir.mkdir(parents=True, exist_ok=True)
+    ninja_path = maybe_nuke_cmake_cache(build_dir)
+
+    cmake_args = [
+        "-S",
+        str(SOURCE_DIR),
+        "-B",
+        str(build_dir),
+        "-G",
+        generator,
+        f"-DCMAKE_BUILD_TYPE={build_type}",
+        # Pass both spellings because the top-level project and fetched
+        # dependencies may use different FindPython modules.
+        f"-DPython_EXECUTABLE={sys.executable}",
+        f"-DPython3_EXECUTABLE={sys.executable}",
+    ]
+    if generator.startswith("Ninja") and ninja_path:
+        cmake_args.append(f"-DCMAKE_MAKE_PROGRAM={ninja_path}")
+    add_env_cmake_setting(cmake_args, "ONNXRUNTIME_SOURCE_DIR")
+    add_env_cmake_setting(cmake_args, "ONNXRUNTIME_VERSION")
+    add_env_cmake_setting(
+        cmake_args, "ONNXRUNTIME_EP_IREE_IREE_SOURCE_DIR", "IREE_SOURCE_DIR"
+    )
+    add_env_cmake_setting(
+        cmake_args, "ONNXRUNTIME_EP_IREE_C_COMPILER", "CMAKE_C_COMPILER"
+    )
+    add_env_cmake_setting(
+        cmake_args, "ONNXRUNTIME_EP_IREE_CXX_COMPILER", "CMAKE_CXX_COMPILER"
+    )
+
+    subprocess.check_call([CMAKE_EXE] + cmake_args)
+    subprocess.check_call(
+        [CMAKE_EXE, "--build", str(build_dir), "--config", build_type]
+    )
+    subprocess.check_call(
+        [
+            CMAKE_EXE,
+            "--install",
+            str(build_dir),
+            "--config",
+            build_type,
+            "--prefix",
+            str(stage_dir),
+        ]
+    )
+    return find_library(stage_dir)
+
+
+class CMakeBuildPy(_build_py):
+    def run(self):
+        super().run()
+        try:
+            built_library = build_native_extension()
+        except subprocess.CalledProcessError:
+            # Editable installs route through setuptools, which otherwise tends
+            # to collapse native build failures into a generic packaging error.
+            # Keep the underlying traceback visible and fail the install
+            # immediately.
+            print("Native build failed:")
+            traceback.print_exc()
+            sys.exit(1)
+        target_dir = pathlib.Path(self.build_lib) / "onnxruntime_ep_iree"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        # Wheels should contain exactly the freshly staged EP library and not a
+        # leftover artifact from a previous platform or build configuration.
+        for pattern in ("*.so", "*.dylib", "*.dll"):
+            for candidate in target_dir.glob(pattern):
+                candidate.unlink()
+        shutil.copyfile(built_library, target_dir / built_library.name)
 
 
 # ---------------------------------------------------------------------------
@@ -82,12 +168,20 @@ setup(
     version="0.1.0",
     description="Python helpers for the IREE ONNX Runtime Execution Provider",
     packages=["onnxruntime_ep_iree"],
-    # Includes ``*.dylib``, ``*.so``, ``*.dll`` so that when the library IS copied
-    # for wheel builds, it ends up in the installed package.
-    package_data={
-        "onnxruntime_ep_iree": ["*.dylib", "*.so", "*.dll"],
+    cmdclass={
+        "build_py": CMakeBuildPy,
     },
-    include_package_data=True,
+    # Include only the packaged EP shared library so stale local artifacts do
+    # not leak into wheels.
+    package_data={
+        "onnxruntime_ep_iree": [
+            "libonnxruntime_ep_iree.dylib",
+            "libonnxruntime_ep_iree.so",
+            "onnxruntime_ep_iree.dll",
+        ],
+    },
+    include_package_data=False,
     distclass=BinaryDistribution,
     python_requires=">=3.10",
+    zip_safe=False,
 )

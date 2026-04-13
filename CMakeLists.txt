@@ -23,7 +23,12 @@ include(FetchContent)
 #
 ################################################################################
 
-set(ONNXRUNTIME_VERSION "1.24.1")
+set(
+  ONNXRUNTIME_VERSION
+  "1.24.1"
+  CACHE STRING
+  "ONNX Runtime version to fetch when ONNXRUNTIME_SOURCE_DIR is unset"
+)
 set(ONNXRUNTIME_SOURCE_DIR "" CACHE FILEPATH "Path to ONNX Runtime source")
 
 if(ONNXRUNTIME_SOURCE_DIR)
