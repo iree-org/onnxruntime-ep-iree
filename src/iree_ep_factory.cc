@@ -16,6 +16,8 @@
 #include <mutex>
 #include <string>
 
+#include "iree/async/util/proactor_pool.h"
+#include "iree/base/threading/numa.h"
 #include "iree/base/tracing.h"
 #include "iree_allocator.h"
 #include "iree_compile.h"
@@ -182,11 +184,28 @@ iree_hal_device_t* IreeEpFactory::GetDeviceForIdLocked(uint32_t device_id) {
 
   // Build device URI and create HAL device.
   std::string device_uri = std::string(driver_name) + "://" + device_path;
+  iree_async_proactor_pool_t* proactor_pool = nullptr;
+  iree_status_t status = iree_async_proactor_pool_create(
+      iree_numa_node_count(), /*node_ids=*/nullptr,
+      iree_async_proactor_pool_options_default(), iree_allocator_system(),
+      &proactor_pool);
+  if (!iree_status_is_ok(status)) {
+    ORT_CXX_LOGF_NOEXCEPT(logger_, ORT_LOGGING_LEVEL_ERROR,
+                          "IREE EP: Failed to create proactor pool for %s",
+                          device_uri.c_str());
+    iree_status_ignore(status);
+    return nullptr;
+  }
+
+  iree_hal_device_create_params_t create_params =
+      iree_hal_device_create_params_default();
+  create_params.proactor_pool = proactor_pool;
   HalDevicePtr hal_device;
-  iree_status_t status = iree_hal_create_device(
+  status = iree_hal_create_device(
       iree_runtime_instance_driver_registry(IreeInstance()),
       iree_make_string_view(device_uri.data(), device_uri.size()),
-      iree_allocator_system(), hal_device.ForOutput());
+      &create_params, iree_allocator_system(), hal_device.ForOutput());
+  iree_async_proactor_pool_release(proactor_pool);
 
   if (!iree_status_is_ok(status)) {
     ORT_CXX_LOGF_NOEXCEPT(logger_, ORT_LOGGING_LEVEL_ERROR,
