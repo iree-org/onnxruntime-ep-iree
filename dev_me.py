@@ -37,7 +37,9 @@ import sys
 
 CMAKE_REQUIRED_VERSION = (3, 24)
 PYTHON_REQUIRED_VERSION = (3, 10)
-SETUPTOOLS_REQUIRED_VERSION = (64, 0)
+SETUPTOOLS_REQUIRED_VERSION = (77, 0)
+
+DEFAULT_BUILD_TYPE = "RelWithDebInfo"
 
 
 def parse_version_components(version_text: str) -> tuple[int, ...]:
@@ -235,13 +237,13 @@ class EnvInfo:
 
 def has_configure_overrides(args: argparse.Namespace) -> bool:
     return any(
-        [
+        (
             args.cmake is not None,
             args.clang is not None,
             args.onnxruntime is not None,
             args.iree is not None,
-            args.build_type != "Debug",
-        ]
+            args.build_type != DEFAULT_BUILD_TYPE,
+        )
     )
 
 
@@ -334,8 +336,8 @@ def main(argv: list[str]) -> None:
     parser.add_argument("--iree", type=Path, help="Path to an IREE source checkout")
     parser.add_argument(
         "--build-type",
-        default="RelWithDebInfo",
-        help="CMake build type (default: RelWithDebInfo)",
+        default=DEFAULT_BUILD_TYPE,
+        help=f"CMake build type (default: {DEFAULT_BUILD_TYPE})",
     )
     args = parser.parse_args(argv)
 
