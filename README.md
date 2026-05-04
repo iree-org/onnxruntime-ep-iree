@@ -46,6 +46,56 @@ ONNXRUNTIME_VERSION=1.24.1
 ONNXRUNTIME_EP_IREE_IREE_SOURCE_DIR=/path/to/iree
 ```
 
+## Runtime Provider Options
+
+Python users normally pass IREE EP runtime options through
+`SessionOptions.add_provider_for_devices`:
+
+```python
+sess_options = ort.SessionOptions()
+sess_options.add_provider_for_devices(
+    [iree_device],
+    {
+        "target_arch": "gfx1100",
+        "opt_level": "O3",
+        "dim_specs": "batch(1,1), seq(1,131072,16)",
+    },
+)
+session = ort.InferenceSession(model_path, sess_options=sess_options)
+```
+
+The Python provider option names are stored internally as ONNX Runtime session
+configuration entries with an `ep.iree.` prefix. If setting session config
+entries directly, use the full `ep.iree.*` names.
+
+| Python provider option | Session config entry | Default | Description |
+| --- | --- | --- | --- |
+| `target_arch` | `ep.iree.target_arch` | Empty | Target architecture for IREE compilation. Required for `hip`, `cuda`, and `vulkan`; CPU backends use the host target. Examples: `gfx1100`, `sm_90`. |
+| `opt_level` | `ep.iree.opt_level` | `O0` | IREE compiler optimization level, such as `O0`, `O1`, `O2`, or `O3`. |
+| `save_intermediates` | `ep.iree.save_intermediates` | `0` | Set to `1` to keep generated MLIR, VMFB, and IRPA files for debugging. The EP logs the saved paths. |
+| `enable_ep_context_cache` | `ep.iree.enable_ep_context_cache` | `0` | Set to `1` to keep compiled VMFB and IRPA artifacts for ONNX Runtime EP context caching when `save_intermediates` is not set. |
+| `extern_kernel_path` | `ep.iree.extern_kernel_path` | Empty | Directory containing precompiled extern dispatch kernel objects, such as `.co` files. |
+| `dim_specs` | `ep.iree.dim_specs` | Empty | Dimension specialization constraints. See the syntax below. |
+| `compiler_lib_path` | `ep.iree.compiler_lib_path` | Empty | Absolute path to the IREE compiler shared library. This is process-global: the first successful compiler initialization wins. If unset, the EP auto-discovers the compiler library. |
+
+### Dimension Specialization (`dim_specs`)
+
+`dim_specs` constrains symbolic dimensions and can describe one or more
+specialized variants. Each spec has the form `name(min,max)` for an inclusive
+range or `name(min,max,div)` for a range plus a divisibility constraint. Static
+dimensions use the same value for `min` and `max`, such as `batch(1,1)`.
+Commas separate specs within one variant, and semicolons separate variants.
+Variants are checked in user-provided order at runtime, so the first matching
+variant wins.
+
+Examples:
+
+```text
+batch(1,1), seq(64,64)
+seq(1,131072,16)
+batch(1,1), seq(64,64); seq(1,131072,16)
+```
+
 ## Recommended Dev Setup
 
 For developers, we recommend using `dev_me.py` for editable installs and
