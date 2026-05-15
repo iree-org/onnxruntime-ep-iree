@@ -181,9 +181,14 @@ size_t OnnxElementTypeSize(ONNXTensorElementDataType type);
 
 // Converts an ORT input tensor to an IREE buffer view.
 //
-// If the tensor is already on an IREE device (detected via vendor_id), the
-// existing buffer is wrapped in a view without copying data. Otherwise, a new
-// buffer is allocated on the device and data is copied from host.
+// If the tensor is already on the caller's IREE device (vendor_id and
+// device_id both match), the existing buffer is wrapped in a view without
+// copying data. If the tensor is on a different IREE device (vendor matches
+// but device_id does not), the function returns an explicit error rather
+// than silently aliasing a buffer that belongs to a different device — cross
+// IREE-device transfer must be done via the OrtDataTransfer interface.
+// Otherwise (host or non-IREE device), a new buffer is allocated on the
+// device and data is copied from host.
 //
 // Parameters:
 //   ort_value - Input ORT tensor (const, read-only)
@@ -192,28 +197,54 @@ size_t OnnxElementTypeSize(ONNXTensorElementDataType type);
 //   host_allocator - Host allocator for metadata
 //   out_buffer_view - Output buffer view (caller must release)
 //   ep_api - EP API for checking memory device info
+//   ep_device_id - Caller EP's device id (used together with vendor_id to
+//                  decide whether ort_value lives on the caller's device)
 //   logger - Logger for tracing
 //
 // Returns nullptr on success, OrtStatus* on error.
-OrtStatus* OrtTensorToIreeBufferView(const Ort::ConstValue& ort_value,
-                                     iree_hal_device_t* device,
-                                     iree_hal_allocator_t* allocator,
-                                     iree_allocator_t host_allocator,
-                                     iree_hal_buffer_view_t** out_buffer_view,
-                                     const OrtEpApi& ep_api,
-                                     const Ort::Logger& logger);
+OrtStatus* OrtTensorToIreeBufferView(
+    const Ort::ConstValue& ort_value, iree_hal_device_t* device,
+    iree_hal_allocator_t* allocator, iree_allocator_t host_allocator,
+    iree_hal_buffer_view_t** out_buffer_view, const OrtEpApi& ep_api,
+    uint32_t ep_device_id, const Ort::Logger& logger);
+
+// Allocates a fresh IREE device-local buffer view for an ORT tensor, without
+// reading or copying its contents.
+//
+// Intended for caller-provided output storage when the ORT-allocated output
+// tensor is host-resident and cannot be zero-copy wrapped. The kernel writes
+// into the returned buffer; the caller is responsible for the post-execution
+// device-to-host copy back into ort_value.
+//
+// Parameters:
+//   ort_value - ORT tensor whose shape and element type seed the allocation
+//   device - IREE HAL device for allocation
+//   allocator - Device allocator from session
+//   out_buffer_view - Output buffer view (caller must release)
+//
+// Returns nullptr on success, OrtStatus* on error.
+OrtStatus* AllocateIreeStorageForOrtTensor(
+    const Ort::ConstValue& ort_value, iree_hal_device_t* device,
+    iree_hal_allocator_t* allocator, iree_hal_buffer_view_t** out_buffer_view);
 
 // Copies data from an IREE buffer view to an ORT output tensor.
 //
-// If the output tensor is on an IREE device (detected via vendor_id), the
-// buffer is copied directly without device-to-host transfer. Otherwise, data
-// is transferred from device to host memory.
+// If the output tensor is on the caller's IREE device (vendor_id and
+// device_id both match), the buffer is copied directly without
+// device-to-host transfer. If the tensor is on a different IREE device
+// (vendor matches but device_id does not), the function returns an explicit
+// error rather than issuing a D2D from the caller's device into a buffer
+// owned by another device — cross IREE-device transfer must be done via the
+// OrtDataTransfer interface. Otherwise (host or non-IREE device), data is
+// transferred from device to host memory.
 //
 // Parameters:
 //   buffer_view - Input IREE buffer view
 //   ort_value - Output ORT tensor (mutable)
 //   device - IREE HAL device for transfer
 //   ep_api - EP API for checking memory device info
+//   ep_device_id - Caller EP's device id (used together with vendor_id to
+//                  decide whether ort_value lives on the caller's device)
 //   logger - Logger for tracing
 //
 // Returns nullptr on success, OrtStatus* on error.
@@ -221,6 +252,7 @@ OrtStatus* IreeBufferViewToOrtTensor(iree_hal_buffer_view_t* buffer_view,
                                      Ort::UnownedValue ort_value,
                                      iree_hal_device_t* device,
                                      const OrtEpApi& ep_api,
+                                     uint32_t ep_device_id,
                                      const Ort::Logger& logger);
 
 // Extracts shape from an IREE buffer view as int64_t vector for ORT.

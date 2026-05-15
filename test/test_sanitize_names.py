@@ -106,3 +106,17 @@ def test_dollar_escaped_mlir(cpu_device, target_arch):
 
     assert "%a$24$2D$24$b" in mlir
     assert "%a$2D$b" in mlir
+
+
+def test_double_underscore_prefix_reserved_mlir(cpu_device, target_arch):
+    """The leading '__' prefix is reserved for internally-synthesized names."""
+    mlir = _generate_mlir(
+        ["__iree_ep_inplace_storage_0", "__plain"], cpu_device, target_arch
+    )
+
+    # '__iree_ep_inplace_storage_0' -> '$5F$_iree_ep_inplace_storage_0'
+    # '__plain'                     -> '$5F$_plain'
+    assert "%$5F$_iree_ep_inplace_storage_0" in mlir
+    assert "%$5F$_plain" in mlir
+    assert "%__iree_ep_inplace_storage_0:" not in mlir
+    assert "%__plain:" not in mlir

@@ -22,6 +22,7 @@
 #include "dim_spec.h"
 #include "iree_ep_factory.h"
 #include "iree_wrappers.h"
+#include "mlir_gen.h"
 #include "ort_import.h"
 
 namespace onnxruntime::iree {
@@ -51,6 +52,14 @@ class IreeEp : public OrtEp, public ApiPtrs {
     std::string extern_kernel_path = "";
     // Parsed dim spec variants from "ep.iree.dim_specs" session option.
     std::vector<DimSpecVariant> dim_spec_variants;
+    // Flag to emit the canonical Torch in-place-output pattern which basically
+    // consists of the following :-
+    // 1. `!torch.tensor` storage args.
+    // 2. `torch.overwrite.tensor.contents`
+    // 3. `torch.copy.to_vtensor`.
+    // Currently enabled for static-shape outputs and pre-binds ORT-allocated
+    // output buffers at invoke time. Default on.
+    bool enable_inplace_outputs = true;
   };
 
   IreeEp(IreeEpFactory& factory, const std::string& name, const Config& config,
@@ -60,6 +69,9 @@ class IreeEp : public OrtEp, public ApiPtrs {
 
   // Accessor for the IREE device (from factory's device cache).
   [[nodiscard]] iree_hal_device_t* IreeDevice() const;
+
+  // Accessor for the IREE device ID.
+  [[nodiscard]] uint32_t DeviceId() const { return device_id_; }
 
   // Accessor for the logger.
   [[nodiscard]] const Ort::Logger& Logger() const { return logger_; }
@@ -147,7 +159,8 @@ struct IreeNodeComputeInfo : OrtNodeComputeInfo {
                       ParameterIndexPtr parameter_index,
                       ParameterProviderPtr parameter_provider,
                       std::vector<VariantInfo> variant_infos,
-                      std::vector<SymbolicDimMapping> dim_mappings);
+                      std::vector<SymbolicDimMapping> dim_mappings,
+                      std::vector<OutputBindingInfo> output_bindings);
 
   ~IreeNodeComputeInfo();
 
@@ -178,6 +191,8 @@ struct IreeNodeComputeInfo : OrtNodeComputeInfo {
   std::vector<VariantInfo> variant_infos_;
   // Mappings from symbolic names to input tensor positions for dispatch.
   std::vector<SymbolicDimMapping> dim_mappings_;
+  // Per-output binding info captured during MLIR generation.
+  const std::vector<OutputBindingInfo> output_bindings_;
 
   // Runtime state (lazily initialized on first ComputeImpl call).
   RuntimeSessionPtr session_;

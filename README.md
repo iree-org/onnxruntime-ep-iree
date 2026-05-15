@@ -77,6 +77,7 @@ entries directly, use the full `ep.iree.*` names.
 | `extern_kernel_path` | `ep.iree.extern_kernel_path` | Empty | Directory containing precompiled extern dispatch kernel objects, such as `.co` files. |
 | `dim_specs` | `ep.iree.dim_specs` | Empty | Dimension specialization constraints. See the syntax below. |
 | `compiler_lib_path` | `ep.iree.compiler_lib_path` | Empty | Absolute path to the IREE compiler shared library. This is process-global: the first successful compiler initialization wins. If unset, the EP auto-discovers the compiler library. |
+| `enable_inplace_outputs` | `ep.iree.enable_inplace_outputs` | `1` | Set to `0` to disable in-place output emission for static-shape outputs. When enabled (the default), the generated MLIR uses the canonical Torch in-place pattern (`!torch.tensor` storage args + `torch.overwrite.tensor.contents` + `torch.copy.to_vtensor`) and the runtime pre-binds ORT-allocated output buffers at invoke time, eliminating one `stream.resource.alloca` and one post-execution copy per tied output. |
 
 ### Dimension Specialization (`dim_specs`)
 

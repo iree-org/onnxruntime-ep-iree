@@ -121,25 +121,38 @@ ErrorOr<std::string> GetElementType(ONNXTensorElementDataType dtype,
   }
 }
 
-// Formats a tensor type as !torch.vtensor<[dims],dtype>.
-// Dynamic dims are always emitted as "?".
-ErrorOr<std::string> FormatTensorType(const Ort::ConstTypeInfo& type_info) {
+// Returns true iff every dim in the tensor's shape is static i.e. >= 0.
+static bool IsStaticShape(const Ort::ConstTypeInfo& type_info) {
+  if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
+    return false;
+  }
+  auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+  auto shape = tensor_info.GetShape();
+  for (int64_t d : shape) {
+    if (d < 0) return false;
+  }
+  return true;
+}
+
+// Shared body of FormatTensorType / FormatStorageTensorType. The only
+// difference between the value-semantics form (`!torch.vtensor`) and the
+// mutable storage form (`!torch.tensor`) is the leading keyword; everything
+// else (shape, dtype) is identical.
+static ErrorOr<std::string> FormatTorchTensorTypeImpl(
+    const Ort::ConstTypeInfo& type_info, bool value_semantics) {
   if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
     return errorWithCode(ErrorCode::kNotImplemented,
                          "Non-tensor type {} not supported",
                          static_cast<int>(type_info.GetONNXType()));
   }
-
   auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
   auto shape = tensor_info.GetShape();
   auto dtype = tensor_info.GetElementType();
 
   std::ostringstream ss;
-  ss << "!torch.vtensor<[";
+  ss << (value_semantics ? "!torch.vtensor<[" : "!torch.tensor<[");
   for (size_t i = 0; i < shape.size(); ++i) {
-    if (i > 0) {
-      ss << ",";
-    }
+    if (i > 0) ss << ",";
     if (shape[i] < 0) {
       // TODO: Ensure that dynamic dimensions are actually represented as -1. I
       // checked and they seem to but an example to check would be good.
@@ -151,6 +164,36 @@ ErrorOr<std::string> FormatTensorType(const Ort::ConstTypeInfo& type_info) {
   IREE_EP_ASSIGN_OR_RETURN(std::string elem_type, GetElementType(dtype));
   ss << "]," << elem_type << ">";
   return ss.str();
+}
+
+// Formats a tensor type as !torch.tensor<[dims],dtype> (mutable / non-value
+// semantics). This is the form `torch.overwrite.tensor.contents` requires
+// for its destination operand.
+static ErrorOr<std::string> FormatStorageTensorType(
+    const Ort::ConstTypeInfo& type_info) {
+  return FormatTorchTensorTypeImpl(type_info, /*value_semantics=*/false);
+}
+
+// Formats a tensor type as !torch.vtensor<[dims],dtype>.
+// Dynamic dims are always emitted as "?".
+ErrorOr<std::string> FormatTensorType(const Ort::ConstTypeInfo& type_info) {
+  return FormatTorchTensorTypeImpl(type_info, /*value_semantics=*/true);
+}
+
+// Internal SSA names for the in-place output pattern.
+//
+// Collision-free with any sanitized ONNX identifier because SanitizeName
+// reserves the leading `__` prefix (any user name that would sanitize to
+// `__...` has its first underscore escaped to `$5F$`).
+//
+// TODO: replace this prefix scheme once the planned graph-wide name
+// uniquifier (tracked in a follow-up PR) lands; that helper will subsume
+// this and the other ad-hoc prefixes emitted by the MLIR generator.
+static std::string InPlaceStorageName(size_t storage_arg_pos) {
+  return std::format("__iree_ep_inplace_storage_{}", storage_arg_pos);
+}
+static std::string InPlaceStorageVtName(size_t storage_arg_pos) {
+  return std::format("__iree_ep_inplace_storage_vt_{}", storage_arg_pos);
 }
 
 // Formats a tensor type as tensor<dimsxdtype> (standard MLIR format).
@@ -208,11 +251,13 @@ bool ParseInputRef(const std::string& spec, size_t& input_idx) {
 class MlirGenerator {
  public:
   MlirGenerator(const Ort::ConstGraph& graph, std::ostream& out,
-                const std::string& irpa_path, TargetConfig target_config)
+                const std::string& irpa_path, TargetConfig target_config,
+                bool enable_inplace_outputs)
       : graph_(graph),
         out_(out),
         irpa_path_(irpa_path),
-        target_config_(std::move(target_config)) {}
+        target_config_(std::move(target_config)),
+        enable_inplace_outputs_(enable_inplace_outputs) {}
 
   // A single (suffix, dim_specs) variant for MLIR generation.
   struct VariantInfo {
@@ -224,13 +269,16 @@ class MlirGenerator {
   // All functions share the same module (and thus the same parameter
   // references), so when compiled to a single VMFB the weights are shared.
   // For the unspecialized case, pass a single variant with empty suffix/specs.
-  // Populates function_names with the MLIR function name for each variant.
+  // Populates function_names with the MLIR function name for each variant
+  // and output_bindings with one entry per graph output (in order).
   MaybeError Generate(const std::vector<VariantInfo>& variants,
-                      std::vector<std::string>& function_names) {
+                      std::vector<std::string>& function_names,
+                      std::vector<OutputBindingInfo>& output_bindings) {
     CollectMetadata();
     function_names.clear();
     function_names.reserve(variants.size());
 
+    output_bindings = ComputeOutputBindings();
     EmitModulePrologue();
     for (const auto& v : variants) {
       ConfigureForVariant(*v.specs, v.suffix);
@@ -312,6 +360,34 @@ class MlirGenerator {
     }
   }
 
+  // Computes which outputs are tied to a caller-provided storage arg and the
+  // storage arg's position in the function signature. Invariant across
+  // variants, so call once after CollectMetadata() and before any variant
+  // emission. Returns the per-output binding info for the caller; also
+  // populates storage_arg_indices_ which is read by EmitFunctionHeader and
+  // EmitReturn during emission.
+  // TODO: Revisit once dynamic output shapes are supported.
+  std::vector<OutputBindingInfo> ComputeOutputBindings() {
+    std::vector<OutputBindingInfo> bindings(graph_outputs_.size());
+    storage_arg_indices_.assign(graph_outputs_.size(), kNoStorageArg);
+    if (!enable_inplace_outputs_) {
+      // Disabled by session option: leave every binding's shape as
+      // nullopt so EmitFunctionHeader/EmitReturn fall back to the legacy
+      // out-of-place lowering and the runtime side stays on the
+      // post-execution copy path.
+      return bindings;
+    }
+    size_t storage_arg_pos = graph_inputs_.size();
+    for (size_t i = 0; i < graph_outputs_.size(); ++i) {
+      const auto type_info = graph_outputs_[i].TypeInfo();
+      if (!IsStaticShape(type_info)) continue;
+      auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+      bindings[i].shape = tensor_info.GetShape();
+      storage_arg_indices_[i] = storage_arg_pos++;
+    }
+    return bindings;
+  }
+
   // Configures the generator for a variant (dim specs, function name suffix).
   // Must be called before EmitFunctionHeader/EmitFunctionBody for each variant.
   void ConfigureForVariant(const DimSpecVariant& specs,
@@ -364,6 +440,9 @@ class MlirGenerator {
   // Emits the function signature with current dim specs and function name.
   // Constrained input args are renamed to %name__orig so EmitDimConstraints()
   // can rebind the original name after applying shape assumptions.
+  //
+  // For static-shape outputs, also emits an extra mutable storage arg per
+  // output after the regular inputs.
   MaybeError EmitFunctionHeader() {
     std::ostringstream args;
     for (size_t i = 0; i < graph_inputs_.size(); ++i) {
@@ -378,6 +457,21 @@ class MlirGenerator {
       } else {
         args << "%" << name << ": " << type;
       }
+    }
+
+    // Append storage args for static-shape outputs, in result-index order.
+    // Indices were precomputed by ComputeOutputBindings(); each is the
+    // position the runtime side pushes the ORT-allocated buffer view at.
+    for (size_t i = 0; i < graph_outputs_.size(); ++i) {
+      if (storage_arg_indices_[i] == kNoStorageArg) continue;
+      if (storage_arg_indices_[i] > 0) {
+        args << ", ";
+      }
+      IREE_EP_ASSIGN_OR_RETURN(
+          std::string storage_type,
+          FormatStorageTensorType(graph_outputs_[i].TypeInfo()));
+      args << "%" << InPlaceStorageName(storage_arg_indices_[i]) << ": "
+           << storage_type;
     }
 
     // Build return types.
@@ -1014,6 +1108,33 @@ class MlirGenerator {
   }
 
   MaybeError EmitReturn() {
+    // For each tied (static-shape) output, write the freshly-computed result
+    // into the caller-provided storage arg, then read it back as a vtensor.
+    // The torch.copy.to_vtensor is purely a value-semantics bridge so we can
+    // satisfy the function's `-> !torch.vtensor` return type from the
+    // mutable `!torch.tensor` storage arg; it does NOT introduce a new
+    // allocation. The IREE pipeline (Torch -> Linalg -> Stream) recognizes
+    // the overwrite + copy.to_vtensor pair against a function-level storage
+    // arg and folds the result into the storage arg's backing buffer.
+    for (size_t i = 0; i < graph_outputs_.size(); ++i) {
+      if (storage_arg_indices_[i] == kNoStorageArg) continue;
+      std::string name = SanitizeName(graph_outputs_[i].GetName());
+      std::string storage_name = InPlaceStorageName(storage_arg_indices_[i]);
+      std::string storage_vt_name =
+          InPlaceStorageVtName(storage_arg_indices_[i]);
+      IREE_EP_ASSIGN_OR_RETURN(std::string vtensor_type,
+                               FormatTensorType(graph_outputs_[i].TypeInfo()));
+      IREE_EP_ASSIGN_OR_RETURN(
+          std::string storage_type,
+          FormatStorageTensorType(graph_outputs_[i].TypeInfo()));
+      out_ << std::format(
+          "    torch.overwrite.tensor.contents %{0} overwrites %{1} : "
+          "{2}, {3}\n",
+          name, storage_name, vtensor_type, storage_type);
+      out_ << std::format("    %{0} = torch.copy.to_vtensor %{1} : {2}\n",
+                          storage_vt_name, storage_name, vtensor_type);
+    }
+
     std::ostringstream ret_values;
     std::ostringstream ret_types;
     for (size_t i = 0; i < graph_outputs_.size(); ++i) {
@@ -1021,7 +1142,11 @@ class MlirGenerator {
         ret_values << ", ";
         ret_types << ", ";
       }
-      ret_values << "%" << SanitizeName(graph_outputs_[i].GetName());
+      if (storage_arg_indices_[i] != kNoStorageArg) {
+        ret_values << "%" << InPlaceStorageVtName(storage_arg_indices_[i]);
+      } else {
+        ret_values << "%" << SanitizeName(graph_outputs_[i].GetName());
+      }
       IREE_EP_ASSIGN_OR_RETURN(std::string ret_type,
                                FormatTensorType(graph_outputs_[i].TypeInfo()));
       ret_types << ret_type;
@@ -1213,6 +1338,13 @@ class MlirGenerator {
   // Whether %__none = torch.constant.none has been emitted in the current
   // function.  Reset at the start of each function body.
   bool none_emitted_ = false;
+
+  static constexpr size_t kNoStorageArg = static_cast<size_t>(-1);
+  // storage-arg index in the function's arg list, or kNoStorageArg if the
+  // output is dynamic.
+  std::vector<size_t> storage_arg_indices_;
+  // Flag to emit the canonical in-place pattern.
+  bool enable_inplace_outputs_ = false;
 };
 
 // Builds an IRPA parameter archive for large initializers.
@@ -1363,29 +1495,32 @@ MaybeError GenerateMlir(
     const Ort::ConstGraph& graph, const OrtApi& /*ort_api*/,
     const std::string& mlir_path, const std::string& irpa_path,
     const std::vector<std::pair<std::string, DimSpecVariant>>& variants,
+    TargetConfig target_config, bool enable_inplace_outputs,
     std::vector<std::string>& out_function_names, ParameterIndexPtr& out_index,
-    ParameterProviderPtr& out_provider, TargetConfig target_config) {
+    ParameterProviderPtr& out_provider,
+    std::vector<OutputBindingInfo>& out_output_bindings) {
   std::ofstream file(mlir_path);
   if (!file.is_open()) {
     return error("Failed to open output file: {}", mlir_path);
   }
 
-  MlirGenerator gen(graph, file, irpa_path, std::move(target_config));
+  MlirGenerator gen(graph, file, irpa_path, std::move(target_config),
+                    enable_inplace_outputs);
 
   std::vector<MlirGenerator::VariantInfo> infos;
   infos.reserve(variants.size());
   for (const auto& [suffix, specs] : variants) {
     infos.push_back({suffix, &specs});
   }
-  IREE_EP_RETURN_IF_ERROR(gen.Generate(infos, out_function_names));
+  IREE_EP_RETURN_IF_ERROR(
+      gen.Generate(infos, out_function_names, out_output_bindings));
 
   file.close();
   if (file.fail()) {
     return error("Failed to write to file: {}", mlir_path);
   }
 
-  IREE_EP_RETURN_IF_ERROR(gen.BuildParameterArchive(out_index, out_provider));
-  return ok();
+  return gen.BuildParameterArchive(out_index, out_provider);
 }
 
 }  // namespace onnxruntime::iree

@@ -432,6 +432,9 @@ OrtStatus* ORT_API_CALL IreeEpFactory::CreateEpImpl(
                                           "0") == "1";
     config.extern_kernel_path =
         sess_opts.GetConfigEntryOrDefault("ep.iree.extern_kernel_path", "");
+    config.enable_inplace_outputs =
+        sess_opts.GetConfigEntryOrDefault("ep.iree.enable_inplace_outputs",
+                                          "1") == "1";
 
     std::string dim_specs_str =
         sess_opts.GetConfigEntryOrDefault("ep.iree.dim_specs", "");

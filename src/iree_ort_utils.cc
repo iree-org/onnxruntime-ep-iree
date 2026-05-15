@@ -126,13 +126,28 @@ size_t OnnxElementTypeSize(ONNXTensorElementDataType type) {
 // Buffer/Tensor Conversion
 // ============================================================================
 
-OrtStatus* OrtTensorToIreeBufferView(const Ort::ConstValue& ort_value,
-                                     iree_hal_device_t* device,
-                                     iree_hal_allocator_t* allocator,
-                                     iree_allocator_t /*host_allocator*/,
-                                     iree_hal_buffer_view_t** out_buffer_view,
-                                     const OrtEpApi& ep_api,
-                                     const Ort::Logger& logger) {
+// Builds the explicit-error status returned when an ORT tensor's device_id
+// matches kEpVendorId but resolves to a different IREE device than the
+// caller's EP.
+static OrtStatus* MakeCrossDeviceError(const char* role,
+                                       uint32_t tensor_device_id,
+                                       uint32_t ep_device_id) {
+  return Ort::Status(
+             std::format(
+                 "IREE EP: {} tensor lives on a different IREE device "
+                 "(device_id={}) than this EP (device_id={}); cross "
+                 "IREE-device transfer must be done via OrtDataTransfer",
+                 role, tensor_device_id, ep_device_id)
+                 .c_str(),
+             ORT_INVALID_ARGUMENT)
+      .release();
+}
+
+OrtStatus* OrtTensorToIreeBufferView(
+    const Ort::ConstValue& ort_value, iree_hal_device_t* device,
+    iree_hal_allocator_t* allocator, iree_allocator_t /*host_allocator*/,
+    iree_hal_buffer_view_t** out_buffer_view, const OrtEpApi& ep_api,
+    uint32_t ep_device_id, const Ort::Logger& logger) {
   *out_buffer_view = nullptr;
 
   // Get tensor info from ORT.
@@ -163,12 +178,17 @@ OrtStatus* OrtTensorToIreeBufferView(const Ort::ConstValue& ort_value,
         .release();
   }
 
-  // Check if tensor is already on an IREE device.
+  // Check if tensor is already on our IREE device (both vendor_id and
+  // device_id must match).
   const OrtMemoryDevice* mem_device =
       ep_api.Value_GetMemoryDevice(ort_value.operator const OrtValue*());
   if (mem_device) {
     uint32_t vendor_id = ep_api.MemoryDevice_GetVendorId(mem_device);
+    uint32_t device_id = ep_api.MemoryDevice_GetDeviceId(mem_device);
     if (vendor_id == kEpVendorId) {
+      if (device_id != ep_device_id) {
+        return MakeCrossDeviceError("input", device_id, ep_device_id);
+      }
       // Tensor already on IREE device - wrap existing buffer without copy.
       ORT_CXX_LOGF_NOEXCEPT(logger, ORT_LOGGING_LEVEL_INFO,
                             "IREE EP: Input tensor already on device, "
@@ -211,22 +231,76 @@ OrtStatus* OrtTensorToIreeBufferView(const Ort::ConstValue& ort_value,
   return nullptr;
 }
 
+OrtStatus* AllocateIreeStorageForOrtTensor(
+    const Ort::ConstValue& ort_value, iree_hal_device_t* device,
+    iree_hal_allocator_t* allocator, iree_hal_buffer_view_t** out_buffer_view) {
+  *out_buffer_view = nullptr;
+
+  auto type_info = ort_value.GetTensorTypeAndShapeInfo();
+  auto onnx_dtype = type_info.GetElementType();
+  auto shape = type_info.GetShape();
+
+  iree_hal_element_type_t iree_dtype = OnnxToIreeElementType(onnx_dtype);
+  if (iree_dtype == IREE_HAL_ELEMENT_TYPE_NONE) {
+    return Ort::Status("IREE EP: Unsupported element type", ORT_NOT_IMPLEMENTED)
+        .release();
+  }
+
+  std::vector<iree_hal_dim_t> iree_shape(shape.begin(), shape.end());
+  size_t byte_size = CalculateTensorByteSize(shape, onnx_dtype);
+
+  // Mirror the empty-tensor guard in OrtTensorToIreeBufferView. See the note
+  // there for context on the HIP-driver quirk this works around.
+  if (byte_size == 0) {
+    return Ort::Status(
+               "IREE EP: Empty tensors are not yet supported on HIP "
+               "backends",
+               ORT_INVALID_ARGUMENT)
+        .release();
+  }
+
+  iree_hal_buffer_params_t buffer_params = {};
+  buffer_params.type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL;
+  buffer_params.usage = IREE_HAL_BUFFER_USAGE_DEFAULT;
+
+  // Allocate the buffer (no initial data => no host-to-device copy).
+  iree_hal_buffer_t* buffer = nullptr;
+  IREE_ORT_RETURN_IF_ERROR(iree_hal_allocator_allocate_buffer(
+      allocator, buffer_params, byte_size, &buffer));
+
+  iree_status_t view_status = iree_hal_buffer_view_create(
+      buffer, iree_shape.size(), iree_shape.data(), iree_dtype,
+      IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
+      iree_hal_device_host_allocator(device), out_buffer_view);
+  // The view retains the buffer; release our local ref unconditionally.
+  iree_hal_buffer_release(buffer);
+  IREE_ORT_RETURN_IF_ERROR(view_status);
+
+  return nullptr;
+}
+
 OrtStatus* IreeBufferViewToOrtTensor(iree_hal_buffer_view_t* buffer_view,
                                      Ort::UnownedValue ort_value,
                                      iree_hal_device_t* device,
                                      const OrtEpApi& ep_api,
+                                     uint32_t ep_device_id,
                                      const Ort::Logger& logger) {
   // Get buffer from view.
   iree_hal_buffer_t* buffer = iree_hal_buffer_view_buffer(buffer_view);
   iree_device_size_t byte_length =
       iree_hal_buffer_view_byte_length(buffer_view);
 
-  // Check if output tensor is on an IREE device.
+  // Check if output tensor is on our IREE device (both vendor_id and
+  // device_id must match).
   const OrtMemoryDevice* mem_device =
       ep_api.Value_GetMemoryDevice(ort_value.operator OrtValue*());
   if (mem_device) {
     uint32_t vendor_id = ep_api.MemoryDevice_GetVendorId(mem_device);
+    uint32_t device_id = ep_api.MemoryDevice_GetDeviceId(mem_device);
     if (vendor_id == kEpVendorId) {
+      if (device_id != ep_device_id) {
+        return MakeCrossDeviceError("output", device_id, ep_device_id);
+      }
       // Output is on device - copy buffer directly (D2D).
       ORT_CXX_LOGF_NOEXCEPT(logger, ORT_LOGGING_LEVEL_INFO,
                             "IREE EP: Output tensor on device, performing D2D "
