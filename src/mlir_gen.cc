@@ -199,7 +199,8 @@ static std::string InPlaceStorageVtName(size_t storage_arg_pos) {
 // Formats a tensor type as tensor<dimsxdtype> (standard MLIR format).
 // Uses signless integer types as required by MLIR tensor dialect.
 // Dynamic dims are always emitted as "?".
-ErrorOr<std::string> FormatMlirTensorType(const Ort::ConstTypeInfo& type_info) {
+ErrorOr<std::string> FormatMlirTensorType(const Ort::ConstTypeInfo& type_info,
+                                          bool signless = true) {
   if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) {
     return errorWithCode(ErrorCode::kNotImplemented,
                          "Non-tensor type {} not supported",
@@ -221,7 +222,7 @@ ErrorOr<std::string> FormatMlirTensorType(const Ort::ConstTypeInfo& type_info) {
     ss << "x";
   }
   IREE_EP_ASSIGN_OR_RETURN(std::string elem_type,
-                           GetElementType(dtype, /*signless=*/true));
+                           GetElementType(dtype, signless));
   ss << elem_type << ">";
   return ss.str();
 }
@@ -512,7 +513,7 @@ class MlirGenerator {
     // Emit dim constraints (util.assume.int + flow.tensor.tie_shape).
     IREE_EP_RETURN_IF_ERROR(EmitDimConstraints());
 
-    // Emit initializers as flow.tensor.constant ops.
+    // Emit initializers (small as vtensor.literal, large as flow.parameter).
     for (const auto& init : initializers_) {
       IREE_EP_RETURN_IF_ERROR(EmitInitializer(init));
     }
@@ -527,15 +528,14 @@ class MlirGenerator {
     return EmitReturn();
   }
 
-  // Emits an initializer as a flow.tensor.constant with a
-  // torch_c.from_builtin_tensor cast. Small initializers use dense<> with
-  // inline hex-encoded data. Large initializers use #flow.parameter.named
-  // (data stored in IRPA archive).
+  // Emits an initializer. Small initializers (<=256 bytes) use
+  // torch.vtensor.literal so torch-mlir conversion patterns can directly
+  // match constant values. Large initializers use flow.tensor.constant
+  // with #flow.parameter.named (data stored in IRPA archive).
   //
   // Output format (small):
-  //   %__raw_name = flow.tensor.constant dense<"0x..."> : tensor<...>
-  //   %name = torch_c.from_builtin_tensor %__raw_name : tensor<...>
-  //       -> !torch.vtensor<[...],dtype>
+  //   %name = torch.vtensor.literal(dense<"0x..."> : tensor<...>)
+  //       : !torch.vtensor<[...],dtype>
   //
   // Output format (large):
   //   %__raw_name = flow.tensor.constant
@@ -554,18 +554,24 @@ class MlirGenerator {
                        OnnxElementTypeSize(tensor_info.GetElementType());
 
     if (byte_size <= kMaxInlineInitializerSize) {
-      // Small: inline with dense<> DenseElementsAttr.
+      // Small: emit as torch.vtensor.literal so torch-mlir conversion
+      // patterns can directly match constant values.
       Ort::ConstValue tensor_value{nullptr};
       IREE_EP_RETURN_IF_ORT_STATUS(init.GetInitializer(tensor_value).release());
       const auto* data =
           static_cast<const uint8_t*>(tensor_value.GetTensorRawData());
       std::string hex = HexEncode(data, tensor_value.GetTensorSizeInBytes());
 
+      // vtensor.literal requires signed integer types (si64, si32, etc.)
+      // in the inner dense attribute, not signless (i64, i32).
+      IREE_EP_ASSIGN_OR_RETURN(
+          std::string signed_tensor_type,
+          FormatMlirTensorType(init.TypeInfo(), /*signless=*/false));
+
       constexpr std::string_view schema =
-          R"(    %__raw_{0} = flow.tensor.constant dense<"{3}"> : {1}
-    %{0} = torch_c.from_builtin_tensor %__raw_{0} : {1} -> {2}
+          R"(    %{0} = torch.vtensor.literal(dense<"{2}"> : {1}) : {3}
 )";
-      out_ << std::format(schema, name, tensor_type, vtensor_type, hex);
+      out_ << std::format(schema, name, signed_tensor_type, hex, vtensor_type);
     } else {
       // Large: parameter reference. Data stored in IRPA archive.
       constexpr std::string_view schema =

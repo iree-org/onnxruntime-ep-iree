@@ -14,19 +14,21 @@ from onnx.numpy_helper import from_array
 # Fixed seed for reproducibility.
 np.random.seed(42)
 
-# Test data. Four initializers, each handled differently:
-#   D_small:     [1, 64] float32 = 256 bytes   -> inline dense<>
+# Test data. Five initializers, each handled differently:
+#   D_small:     [1, 64] float32 = 256 bytes   -> vtensor.literal (inline)
 #   D_large:     [64, 64] float32 = 16384 bytes -> IRPA parameter
 #   D_ext:       [64, 64] float32 = 16384 bytes -> external file (parameter, not in IRPA)
-#   D_ext_small: [1, 64] float32 = 256 bytes    -> external file (inlined as dense<>)
-# Graph: C = (((A + D_small) + D_large) + D_ext) + D_ext_small
+#   D_ext_small: [1, 64] float32 = 256 bytes    -> external file (vtensor.literal)
+#   axes:        [1] int64 = 8 bytes             -> vtensor.literal (int, tests si64 type)
+# Graph: C = ReduceMean((((A + D_small) + D_large) + D_ext) + D_ext_small, axes=[1])
 SHAPE = [64, 64]
 A_DATA = np.random.rand(*SHAPE).astype(np.float32)
 B_SMALL = np.random.rand(1, 64).astype(np.float32)
 B_LARGE = np.random.rand(*SHAPE).astype(np.float32)
 B_EXT = np.random.rand(*SHAPE).astype(np.float32)
 B_EXT_SMALL = np.random.rand(1, 64).astype(np.float32)
-EXPECTED = (((A_DATA + B_SMALL) + B_LARGE) + B_EXT) + B_EXT_SMALL
+SUM_ALL = (((A_DATA + B_SMALL) + B_LARGE) + B_EXT) + B_EXT_SMALL
+EXPECTED = np.mean(SUM_ALL, axis=1, keepdims=True)
 
 
 def _create_model():
@@ -71,7 +73,7 @@ def _create_model():
     ext_tensor.ClearField("raw_data")
     ext_tensor.data_location = TensorProto.EXTERNAL
 
-    # Small external initializer (should be inlined as dense<>).
+    # Small external initializer (should be inlined as vtensor.literal).
     ext_small_filename = "ext_small_weights.bin"
     ext_small_path = os.path.join(model_dir, ext_small_filename)
     ext_small_tensor = from_array(B_EXT_SMALL, name="D_ext_small")
@@ -84,27 +86,33 @@ def _create_model():
     ext_small_tensor.ClearField("raw_data")
     ext_small_tensor.data_location = TensorProto.EXTERNAL
 
+    # Int64 axes initializer for ReduceMean (8 bytes — tests si64 signedness).
+    axes_tensor = from_array(np.array([1], dtype=np.int64), name="axes")
+
     input_a = helper.make_tensor_value_info("A", TensorProto.FLOAT, SHAPE)
-    output = helper.make_tensor_value_info("C", TensorProto.FLOAT, SHAPE)
+    output = helper.make_tensor_value_info("C", TensorProto.FLOAT, [64, 1])
 
     add1 = helper.make_node("Add", inputs=["A", "D_small"], outputs=["T1"])
     add2 = helper.make_node("Add", inputs=["T1", "D_large"], outputs=["T2"])
     add3 = helper.make_node("Add", inputs=["T2", "D_ext"], outputs=["T3"])
-    add4 = helper.make_node("Add", inputs=["T3", "D_ext_small"], outputs=["C"])
+    add4 = helper.make_node("Add", inputs=["T3", "D_ext_small"], outputs=["T4"])
+    reduce_mean = helper.make_node(
+        "ReduceMean", inputs=["T4", "axes"], outputs=["C"], keepdims=1
+    )
 
     graph = helper.make_graph(
-        [add1, add2, add3, add4, const_small, const_large],
+        [add1, add2, add3, add4, reduce_mean, const_small, const_large],
         "test_graph",
         [input_a],
         [output],
-        initializer=[ext_tensor, ext_small_tensor],
+        initializer=[ext_tensor, ext_small_tensor, axes_tensor],
     )
     model = helper.make_model(
         graph,
         producer_name="iree_test",
-        opset_imports=[helper.make_opsetid("", 17)],
+        opset_imports=[helper.make_opsetid("", 18)],
     )
-    model.ir_version = 8
+    model.ir_version = 9
 
     model_path = os.path.join(model_dir, "model.onnx")
     onnx.save(model, model_path)
@@ -164,10 +172,17 @@ def test_with_save_intermediates(iree_device):
 
         mlir_content = open(list(new_mlir)[0]).read()
 
-        # D_small and D_ext_small should be inlined via dense<>.
+        # D_small, D_ext_small, and axes should be vtensor.literal.
+        assert (
+            "torch.vtensor.literal" in mlir_content
+        ), "MLIR should contain torch.vtensor.literal for small constants"
         assert (
             'dense<"0x' in mlir_content
         ), "MLIR should contain inline dense<> attributes"
+        # Int64 axes initializer should use signed type (si64).
+        assert (
+            "si64" in mlir_content
+        ), "int64 initializer should use signed type (si64) in vtensor.literal"
         assert (
             "dense_resource" not in mlir_content
         ), "MLIR should not contain dense_resource (replaced by dense<>)"
